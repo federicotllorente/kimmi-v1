@@ -11,6 +11,8 @@ import torch
 import ollama
 from openwakeword.model import Model
 from faster_whisper import WhisperModel
+from kokoro_onnx import Kokoro
+import sounddevice as sd
 
 # --- CONFIGURACIÓN DE PARÁMETROS ---
 FORMAT = pyaudio.paInt16
@@ -30,6 +32,8 @@ PIPER_EXE = "proj-env/Scripts/piper"
 PIPER_MODEL = "es_MX-claude-high.onnx" # Modelo de voz en español para Piper
 LLM_MODEL = "llama3.2:3b"
 
+kokoro = Kokoro("kokoro/kokoro-v1_0.onnx", "kokoro/voices-v1_0.bin")
+
 # --- INICIALIZACIÓN DE COMPONENTES ---
 print("Cargando modelo Wake Word...")
 oww_model = Model(
@@ -48,49 +52,56 @@ vad_model, _ = torch.hub.load(
 
 print("Cargando Faster-Whisper (STT)...")
 # Usa "cuda" y "float16" si tienes GPU NVIDIA, o "cpu" e "int8" si ejecutas en procesador
-# whisper_model = WhisperModel("small", device="cuda", compute_type="float16")
+whisper_model = WhisperModel("small", device="cuda", compute_type="float16")
 # whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
-whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+# whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
 
 audio = pyaudio.PyAudio()
 
 # --- REPRODUCCIÓN Y SÍNTESIS DE AUDIO ---
-def play_tts_sentence(text: str):
-    """Sintetiza texto a voz usando Piper y reproduce el audio."""
-    if not text.strip():
-        return
+# def play_tts_sentence(text: str):
+#     """Sintetiza texto a voz usando Piper y reproduce el audio."""
+#     if not text.strip():
+#         return
     
-    # Redirigimos la salida de Piper directamente a PyAudio mediante aplay / ffplay / subprocess
-    # Para simplicidad multiplataforma, guardamos un WAV temporal si no usas aplay/paplay:
-    wav_output = "temp_sentence.wav"
-    cmd_piper = [PIPER_EXE, "--model", PIPER_MODEL, "--output_file", wav_output]
+#     # Redirigimos la salida de Piper directamente a PyAudio mediante aplay / ffplay / subprocess
+#     # Para simplicidad multiplataforma, guardamos un WAV temporal si no usas aplay/paplay:
+#     wav_output = "temp_sentence.wav"
+#     cmd_piper = [PIPER_EXE, "--model", PIPER_MODEL, "--output_file", wav_output]
     
-    # Genera el archivo de audio para la oración actual
-    process = subprocess.Popen(cmd_piper, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
-    process.communicate(input=text)
+#     # Genera el archivo de audio para la oración actual
+#     process = subprocess.Popen(cmd_piper, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+#     process.communicate(input=text)
     
-    if not os.path.exists(wav_output):
-        return
+#     if not os.path.exists(wav_output):
+#         return
 
-    # Reproducir WAV generado
-    wf = wave.open(wav_output, 'rb')
-    p_out = pyaudio.PyAudio()
-    stream_out = p_out.open(
-        format=p_out.get_format_from_width(wf.getsampwidth()),
-        channels=wf.getnchannels(),
-        rate=wf.getframerate(),
-        output=True
-    )
+#     # Reproducir WAV generado
+#     wf = wave.open(wav_output, 'rb')
+#     p_out = pyaudio.PyAudio()
+#     stream_out = p_out.open(
+#         format=p_out.get_format_from_width(wf.getsampwidth()),
+#         channels=wf.getnchannels(),
+#         rate=wf.getframerate(),
+#         output=True
+#     )
     
-    data = wf.readframes(1024)
-    while len(data) > 0:
-        stream_out.write(data)
-        data = wf.readframes(1024)
+#     data = wf.readframes(1024)
+#     while len(data) > 0:
+#         stream_out.write(data)
+#         data = wf.readframes(1024)
         
-    stream_out.stop_stream()
-    stream_out.close()
-    p_out.terminate()
-    wf.close()
+#     stream_out.stop_stream()
+#     stream_out.close()
+#     p_out.terminate()
+#     wf.close()
+
+def play_tts_sentence(text: str):
+    if not text.strip(): return
+    # Voces ES en Kokoro v1.0: ef_dora, em_alex, em_santa
+    samples, sample_rate = kokoro.create(text, voice="ef_dora", speed=1.0, lang="es")
+    sd.play(samples, sample_rate)
+    sd.wait()
 
 def tts_worker(sentence_queue: queue.Queue):
     """Worker corriendo en hilo secundario procesando oraciones de la cola."""
