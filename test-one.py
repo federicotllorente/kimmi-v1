@@ -1,6 +1,9 @@
 import os
 import io
+import re
 import wave
+import queue
+import threading
 import subprocess
 import numpy as np
 import pyaudio
@@ -33,6 +36,7 @@ oww_model = Model(
   wakeword_models=["hey_jarvis"],
   inference_framework="onnx"
 )
+# oww_model = Model(inference_framework="onnx")
 
 print("Cargando Silero VAD...")
 vad_model, _ = torch.hub.load(
@@ -44,23 +48,30 @@ vad_model, _ = torch.hub.load(
 
 print("Cargando Faster-Whisper (STT)...")
 # Usa "cuda" y "float16" si tienes GPU NVIDIA, o "cpu" e "int8" si ejecutas en procesador
-whisper_model = WhisperModel("tiny", device="cuda", compute_type="float16")
+# whisper_model = WhisperModel("small", device="cuda", compute_type="float16")
+# whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
 
 audio = pyaudio.PyAudio()
 
-def play_tts(text: str):
+# --- REPRODUCCIÓN Y SÍNTESIS DE AUDIO ---
+def play_tts_sentence(text: str):
     """Sintetiza texto a voz usando Piper y reproduce el audio."""
     if not text.strip():
         return
     
     # Redirigimos la salida de Piper directamente a PyAudio mediante aplay / ffplay / subprocess
     # Para simplicidad multiplataforma, guardamos un WAV temporal si no usas aplay/paplay:
-    wav_output = "temp_response.wav"
-    cmd_piper_file = [PIPER_EXE, "--model", PIPER_MODEL, "--output_file", wav_output]
+    wav_output = "temp_sentence.wav"
+    cmd_piper = [PIPER_EXE, "--model", PIPER_MODEL, "--output_file", wav_output]
     
-    process = subprocess.Popen(cmd_piper_file, stdin=subprocess.PIPE, text=True)
+    # Genera el archivo de audio para la oración actual
+    process = subprocess.Popen(cmd_piper, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
     process.communicate(input=text)
     
+    if not os.path.exists(wav_output):
+        return
+
     # Reproducir WAV generado
     wf = wave.open(wav_output, 'rb')
     p_out = pyaudio.PyAudio()
@@ -81,6 +92,18 @@ def play_tts(text: str):
     p_out.terminate()
     wf.close()
 
+def tts_worker(sentence_queue: queue.Queue):
+    """Worker corriendo en hilo secundario procesando oraciones de la cola."""
+    while True:
+        sentence = sentence_queue.get()
+        if sentence is None:  # Señal de fin de respuesta
+            sentence_queue.task_done()
+            break
+        
+        play_tts_sentence(sentence)
+        sentence_queue.task_done()
+
+# --- CAPTURA Y TRANCRIPCIÓN ---
 def record_user_audio_vad(stream) -> bytes:
     """Graba audio dinámicamente cortando al detectar silencio post-habla."""
     print("\n[Jarvis]: Te escucho...")
@@ -132,7 +155,12 @@ def transcribe_audio(audio_bytes: bytes) -> str:
         wf.writeframes(audio_bytes)
     
     wav_buffer.seek(0)
-    segments, _ = whisper_model.transcribe(wav_buffer, language="es")
+    # segments, _ = whisper_model.transcribe(wav_buffer, language="es")
+    segments, _ = whisper_model.transcribe(
+        wav_buffer, 
+        language="es",
+        initial_prompt="Transcripción de un comando de voz claro para el asistente local Jarvis."
+    )
     return " ".join([segment.text for segment in segments]).strip()
 
 # --- BUCLE PRINCIPAL ---
@@ -145,12 +173,12 @@ def main():
         frames_per_buffer=OWW_CHUNK
     )
     
-    print("\n=== JARVIS EN ESPERA (Escuchando Wake Word) ===")
+    print("\n=== JARVIS EN ESPERA (Streaming TTS activo) ===")
     
     try:
         while True:
             # 1. Escucha continua en busca de Wake Word
-            data = mic_stream.read(CHUNK, exception_on_overflow=False)
+            data = mic_stream.read(OWW_CHUNK, exception_on_overflow=False)
             audio_data = np.frombuffer(data, dtype=np.int16)
             
             # Predicción con openWakeWord
@@ -173,23 +201,57 @@ def main():
                     # 4. Procesamiento LLM (Ollama)
                     system_prompt = (
                         "Eres Jarvis, un asistente local conciso, directo y útil. "
-                        "Responde siempre en español. Sé muy breve y conversacional (1 o 2 oraciones máximo) "
-                        "sin formateo Markdown o listas, ya que tu respuesta será leída por un sintetizador de voz."
+                        "Responde siempre en español. Usa frases cortas y conversacionales (1 o 2 oraciones máximo). "
+                        "Evita completamente el uso de caracteres Markdown (sin asteriscos, guiones o numerales) o "
+                        "listas, ya que tu respuesta será leída por un sintetizador de voz. "
+                        "Si no entiendes la pregunta o lo que digo no tiene mucho sentido, no tengas miedo a "
+                        "preguntarme qué quiero decir o pedirme que reformule mi pregunta o petición. "
+                        "Si te digo que no necesito nada más por ahora, simplemente con decirme \"Vale\" o "
+                        "algo así, es suficiente. Recuerda, sé conciso y pragmático."
                     )
                     
-                    response = ollama.chat(
+                    # 1. Creamos la cola y lanzamos el hilo del sintetizador TTS
+                    sentence_queue = queue.Queue()
+                    tts_thread = threading.Thread(target=tts_worker, args=(sentence_queue,))
+                    tts_thread.start()
+                    
+                    # 2. Solicitamos la respuesta en STREAMING a Ollama
+                    stream = ollama.chat(
                         model=LLM_MODEL,
                         messages=[
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_text}
-                        ]
+                        ],
+                        stream=True
                     )
                     
-                    llm_text = response['message']['content']
-                    print(f"[Jarvis]: {llm_text}")
+                    print("[Jarvis]: ", end="", flush=True)
+                    text_buffer = ""
+                    # Regex para capturar oraciones terminadas en . ! ? o salto de línea
+                    sentence_regex = re.compile(r'([^.!?\n]+[.!?\n]+)')
                     
-                    # 5. Síntesis de Voz (TTS)
-                    play_tts(llm_text)
+                    for chunk in stream:
+                        content = chunk['message']['content']
+                        print(content, end="", flush=True)
+                        text_buffer += content
+                        
+                        # Extraemos frases completas del buffer actual
+                        matches = sentence_regex.findall(text_buffer)
+                        if matches:
+                            for match in matches:
+                                sentence_queue.put(match)
+                                text_buffer = text_buffer[len(match):]
+                    
+                    # Si quedó texto residual en el buffer sin signo de puntuación final
+                    if text_buffer.strip():
+                        sentence_queue.put(text_buffer.strip())
+                    
+                    print()  # Nueva línea tras completar el print en consola
+                    
+                    # 3. Enviamos la señal 'None' para avisar al hilo TTS que no habrá más frases
+                    sentence_queue.put(None)
+                    # Esperamos a que el sintetizador termine de hablar antes de volver a escuchar
+                    tts_thread.join()
                     
                 print("\n=== Volviendo a estado de espera ===")
                 
