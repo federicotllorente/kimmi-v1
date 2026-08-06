@@ -1,4 +1,9 @@
-proj-env
-tools/__pycache__
-temp_sentence.wav
+proj-env/
+__pycache__/
+tools/__pycache__/
 .jarvis_cache/
+temp_sentence.wav
+
+# TTS
+kokoro/
+piper/

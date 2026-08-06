@@ -62,6 +62,10 @@ PIPER_MODEL = "es_MX-claude-high.onnx"
 # Nombre del usuario para el acuse del wake word.
 USER_NAME = "Fede"
 
+# Feature flags
+ENABLE_INTENT_ROUTER = False  # Clasificar intent antes de responder (añade latencia)
+ENABLE_TOOLS = True  # Function calling / acciones locales
+
 # Variantes del acuse; usa {name} donde quieras el nombre.
 WAKE_ACK_PHRASES = [
     "Sí, {name}?",
@@ -73,13 +77,48 @@ WAKE_ACK_PHRASES = [
     "¿Qué necesitas, {name}?",
 ]
 
+# Cierres cuando el usuario termina (gracias, listo, etc.) — sin repreguntar.
+CLOSING_ACK_PHRASES = [
+    "De nada.",
+    "Cuando quieras.",
+    "Aquí estaré.",
+    "Perfecto.",
+    "Hasta luego.",
+    "Avísame si me necesitas.",
+    "Listo.",
+    "Un placer.",
+]
+
+# Heurística: despedida / agradecimiento → cierre corto, sin LLM.
+_CLOSING_RE = re.compile(
+    r"(?i)^\s*("
+    r"gracias(?:\s+(?:mucho|mil))?|"
+    r"(?:muy\s+)?bien(?:\s*,?\s*gracias)?|"
+    r"perfecto(?:\s*,?\s*gracias)?|"
+    r"vale(?:\s*,?\s*gracias)?|"
+    r"ok(?:ay)?(?:\s*,?\s*gracias)?|"
+    r"listo(?:\s*,?\s*gracias)?|"
+    r"eso\s+es\s+todo|"
+    r"nada\s+m[aá]s|"
+    r"ya\s+est[aá]|"
+    r"no\s+(?:necesito\s+)?(?:nada\s+)?m[aá]s|"
+    r"chau|"
+    r"adi[oó]s|"
+    r"hasta\s+luego|"
+    r"nos\s+vemos|"
+    r"bye"
+    r")[\s\.\!\,]*$",
+)
+
 # Modelo ligero: clasificar intención + charla sin tools.
 FAST_MODEL = "qwen2.5:3b"
 # Modelo pesado: solo function calling y resumen tras tools.
 LLM_MODEL = "qwen2.5:14b"
 
 # STT: medium es más preciso que small (cuesta algo más de latencia en GPU).
-WHISPER_MODEL_SIZE = "medium"
+# WHISPER_MODEL_SIZE = "tiny"
+WHISPER_MODEL_SIZE = "small"
+# WHISPER_MODEL_SIZE = "medium"
 WHISPER_BEAM_SIZE = 5
 
 STT_INITIAL_PROMPT = (
@@ -172,7 +211,7 @@ audio = pyaudio.PyAudio()
 def play_tts_sentence(text: str):
     if not text.strip():
         return
-    samples, sample_rate = kokoro.create(text, voice="ef_dora", speed=1.0, lang="es")
+    samples, sample_rate = kokoro.create(text, voice="ef_dora", speed=1.2, lang="es")
     sd.play(samples, sample_rate)
     sd.wait()
 
@@ -213,6 +252,41 @@ def speak_wake_ack():
     ack = template.format(name=USER_NAME)
     print(f"[Jarvis]: {ack}")
     play_tts_sentence(ack)
+
+
+def is_conversation_closing(text: str) -> bool:
+    """True si el usuario está cerrando el turno (gracias, listo, etc.)."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return False
+    if _CLOSING_RE.match(cleaned):
+        return True
+    # Frases cortas que empiezan por gracias / perfecto gracias…
+    lower = cleaned.lower()
+    starters = (
+        "gracias",
+        "perfecto, gracias",
+        "perfecto gracias",
+        "vale, gracias",
+        "ok, gracias",
+        "okay, gracias",
+        "listo, gracias",
+        "eso es todo",
+        "nada más",
+        "nada mas",
+        "ya está",
+        "ya esta",
+        "hasta luego",
+        "nos vemos",
+    )
+    return any(lower == s or lower.startswith(s + " ") or lower.startswith(s + ".") for s in starters)
+
+
+def speak_closing_ack() -> str:
+    """Cierre breve; no pregunta si necesita algo más."""
+    ack = random.choice(CLOSING_ACK_PHRASES)
+    speak_text(ack)
+    return ack
 
 
 # --- CAPTURA Y TRANCRIPCIÓN ---
@@ -406,57 +480,27 @@ def _confirm_action(stream, fn_name: str, fn_args: dict) -> bool:
     return False
 
 
-def handle_user_turn(
-    user_text: str,
-    history: List[Dict[str, Any]],
+def _chat_reply(messages: List[Dict[str, Any]], model: str) -> str:
+    sentence_queue: queue.Queue = queue.Queue()
+    tts_thread = threading.Thread(target=tts_worker, args=(sentence_queue,))
+    tts_thread.start()
+    final = stream_ollama_to_tts(messages, sentence_queue, model=model)
+    sentence_queue.put(None)
+    tts_thread.join()
+    return final or "Listo."
+
+
+def _run_tools_turn(
+    messages: List[Dict[str, Any]],
+    tools: List[dict],
     mic_stream,
 ) -> str:
-    """
-    Pipeline: intent → chat o tools (subset) → confirmación → respuesta.
-    Devuelve el texto final del asistente para el historial.
-    """
-    system_prompt = build_system_prompt(ALLOWED_DATA_ROOT)
-
-    print(f"  [Intent]: clasificando con {FAST_MODEL}...")
-    intent_result = classify_intent(
-        user_text,
-        model=FAST_MODEL,
-        recent_context=history,
-    )
-    print(
-        f"  [Intent]: {intent_result.intent} "
-        f"(conf={intent_result.confidence:.2f}) — {intent_result.brief_reason}"
-    )
-
-    low_confidence = intent_result.confidence < INTENT_CONFIDENCE_THRESHOLD
-    if intent_result.intent == "clarify" or low_confidence:
-        final = (
-            "No estoy seguro de lo que pediste. "
-            "¿Puedes reformularlo en una frase más concreta?"
-        )
-        speak_text(final)
-        return final
-
-    if not intent_result.should_use_tools:
-        # Charla: modelo ligero (no hace falta el 14B)
-        messages = _build_messages(system_prompt, history, user_text)
-        sentence_queue: queue.Queue = queue.Queue()
-        tts_thread = threading.Thread(target=tts_worker, args=(sentence_queue,))
-        tts_thread.start()
-        final = stream_ollama_to_tts(messages, sentence_queue, model=FAST_MODEL)
-        sentence_queue.put(None)
-        tts_thread.join()
-        return final or "Listo."
-
-    # Acciones: modelo pesado solo aquí
-    print(f"  [LLM]: usando {LLM_MODEL} para tools...")
-    subset = tools_for_intent(intent_result.intent, tools_schema)
-    messages = _build_messages(system_prompt, history, user_text)
-
+    """Una llamada con tools (modelo pesado) + confirmación + resumen."""
+    print(f"  [LLM]: usando {LLM_MODEL} con tools...")
     response = ollama.chat(
         model=LLM_MODEL,
         messages=messages,
-        tools=subset,
+        tools=tools,
         keep_alive="24h",
     )
 
@@ -466,16 +510,8 @@ def handle_user_turn(
         if direct:
             speak_text(direct)
             return direct
-        # Fallback chat con modelo ligero
-        sentence_queue = queue.Queue()
-        tts_thread = threading.Thread(target=tts_worker, args=(sentence_queue,))
-        tts_thread.start()
-        final = stream_ollama_to_tts(messages, sentence_queue, model=FAST_MODEL)
-        sentence_queue.put(None)
-        tts_thread.join()
-        return final or "Listo."
+        return _chat_reply(messages, FAST_MODEL)
 
-    # Una sola tool por turno
     if len(tool_calls) > 1:
         print(
             f"  [Tools]: el modelo pidió {len(tool_calls)} tools; "
@@ -504,7 +540,7 @@ def handle_user_turn(
         tool_result = available_tools[fn_name](**fn_args)
     except TypeError as exc:
         tool_result = f"Error de argumentos en {fn_name}: {exc}"
-    except Exception as exc:  # noqa: BLE001 — voz: informar fallo
+    except Exception as exc:  # noqa: BLE001
         tool_result = f"Error al ejecutar {fn_name}: {exc}"
 
     messages.append(response["message"])
@@ -512,15 +548,61 @@ def handle_user_turn(
         "role": "tool",
         "content": _truncate(str(tool_result)),
     })
+    return _chat_reply(messages, LLM_MODEL)
 
-    sentence_queue = queue.Queue()
-    tts_thread = threading.Thread(target=tts_worker, args=(sentence_queue,))
-    tts_thread.start()
-    # Resumen post-tool: 14B (ya cargado en este path)
-    final = stream_ollama_to_tts(messages, sentence_queue, model=LLM_MODEL)
-    sentence_queue.put(None)
-    tts_thread.join()
-    return final or "Hecho."
+
+def handle_user_turn(
+    user_text: str,
+    history: List[Dict[str, Any]],
+    mic_stream,
+) -> str:
+    """
+    Pipeline: cierre rápido | (opcional intent) | chat o tools.
+    Devuelve el texto final del asistente para el historial.
+    """
+    # Cierre conversacional: no LLM, no "¿necesitas algo más?"
+    if is_conversation_closing(user_text):
+        print("  [Cierre]: despedida/agradecimiento detectado")
+        return speak_closing_ack()
+
+    system_prompt = build_system_prompt(ALLOWED_DATA_ROOT)
+    messages = _build_messages(system_prompt, history, user_text)
+
+    # --- Modo rápido (sin router de intents) ---
+    if not ENABLE_INTENT_ROUTER:
+        if ENABLE_TOOLS:
+            return _run_tools_turn(messages, tools_schema, mic_stream)
+        return _chat_reply(messages, FAST_MODEL)
+
+    # --- Modo con router de intents ---
+    print(f"  [Intent]: clasificando con {FAST_MODEL}...")
+    intent_result = classify_intent(
+        user_text,
+        model=FAST_MODEL,
+        recent_context=history,
+    )
+    print(
+        f"  [Intent]: {intent_result.intent} "
+        f"(conf={intent_result.confidence:.2f}) — {intent_result.brief_reason}"
+    )
+
+    low_confidence = intent_result.confidence < INTENT_CONFIDENCE_THRESHOLD
+    if intent_result.intent == "clarify" or low_confidence:
+        final = (
+            "No estoy seguro de lo que pediste. "
+            "¿Puedes reformularlo en una frase más concreta?"
+        )
+        speak_text(final)
+        return final
+
+    use_tools = ENABLE_TOOLS and intent_result.should_use_tools
+    if not use_tools:
+        return _chat_reply(messages, FAST_MODEL)
+
+    subset = tools_for_intent(intent_result.intent, tools_schema)
+    if not subset:
+        return _chat_reply(messages, FAST_MODEL)
+    return _run_tools_turn(messages, subset, mic_stream)
 
 
 def main():
@@ -534,8 +616,13 @@ def main():
 
     conversation_history: List[Dict[str, Any]] = []
 
-    print("\n=== JARVIS EN ESPERA (intent router + tools + streaming) ===")
-    print(f"Rápido: {FAST_MODEL} | Pesado (tools): {LLM_MODEL} | Usuario: {USER_NAME}")
+    print("\n=== JARVIS EN ESPERA ===")
+    print(
+        f"Rápido: {FAST_MODEL} | Pesado: {LLM_MODEL} | Usuario: {USER_NAME}"
+    )
+    print(
+        f"Flags: INTENT_ROUTER={ENABLE_INTENT_ROUTER} | TOOLS={ENABLE_TOOLS}"
+    )
 
     try:
         while True:
@@ -569,7 +656,6 @@ def main():
                     "role": "assistant",
                     "content": assistant_text,
                 })
-                # Mantener solo los últimos N turnos
                 max_msgs = HISTORY_MAX_TURNS * 2
                 if len(conversation_history) > max_msgs:
                     conversation_history[:] = conversation_history[-max_msgs:]

@@ -89,10 +89,13 @@ En [`assistant.py`](assistant.py) puedes ajustar:
 
 - `ALLOWED_DATA_ROOT` — sandbox de archivos (por defecto el directorio del proyecto)
 - `USER_NAME` — nombre en el acuse del wake word
-- `FAST_MODEL` — intent + chat (`qwen2.5:3b`)
+- `ENABLE_INTENT_ROUTER` — clasificar intent antes de responder (`False` por defecto; más rápido)
+- `ENABLE_TOOLS` — function calling / acciones locales (`True` por defecto)
+- `FAST_MODEL` — chat rápido (`qwen2.5:3b`)
 - `LLM_MODEL` — tools / resumen (`qwen2.5:14b`)
 - `CURSOR_WORKSPACE` / `CURSOR_MODEL`
 - `HISTORY_MAX_TURNS` — memoria corta de conversación
+- `WHISPER_MODEL_SIZE` / `WHISPER_BEAM_SIZE` — precisión vs latencia del STT
 
 ---
 
@@ -102,23 +105,19 @@ En [`assistant.py`](assistant.py) puedes ajustar:
 Micrófono
    │
    ▼
-Wake word (openWakeWord) ──► VAD + grabación
+Wake word ──► acuse TTS ──► VAD + grabación
    │
    ▼
-Whisper (texto) ──► filtro STT (ruido / vacío → “repite”)
+Whisper (texto) ──► filtro STT
    │
    ▼
-Clasificador de intención (qwen2.5:3b, JSON)
-   │
-   ├─ chat / clarify ──► respuesta con 3B o “reformula” ──► TTS
-   │
-   └─ apps|files|code|… ──► qwen2.5:14b + subset de tools
-         │
-         ├─ sin tool_calls ──► respuesta ──► TTS
-         │
-         └─ 1 tool ──► ¿efecto lateral?
-               ├─ sí ──► confirmar por voz ──► ejecutar ──► resume 14B ──► TTS
-               └─ no ──► ejecutar ──► resume 14B ──► TTS
+¿Cierre? (gracias / listo / adiós…) ──sí──► cierre corto TTS ──► espera wake word
+   │ no
+   ▼
+ENABLE_INTENT_ROUTER?
+   ├─ False (default) ──► ENABLE_TOOLS? ──sí──► 14B + tools ──► TTS
+   │                              └─ no ──► 3B chat ──► TTS
+   └─ True ──► clasificar intent ──► chat 3B o subset tools 14B ──► TTS
 ```
 
 El router vive en [`tools/intent.py`](tools/intent.py). Las tools se registran en [`tools/registry.py`](tools/registry.py); `tools_for_intent` limita qué schemas ve el modelo en cada turno.
