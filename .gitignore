@@ -1,3 +1,4 @@
 proj-env
 tools/__pycache__
 temp_sentence.wav
+.jarvis_cache/

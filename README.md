@@ -1,8 +1,8 @@
 # Jarvis — asistente de voz local
 
-Jarvis es un asistente de IA por voz que corre **en tu máquina**. Escucha una wake word, transcribe lo que dices, razona con un LLM local (Ollama) y puede usar **herramientas** para ayudarte en el día a día: abrir apps, buscar en el código, mirar logs de Docker, crear scaffolds, etc.
+Jarvis es un asistente de IA por voz que corre **en tu máquina**. Escucha una wake word, transcribe lo que dices, clasifica la **intención**, razona con un LLM local (Ollama) y solo entonces puede usar **herramientas** acotadas: abrir apps, buscar en el código, mirar logs de Docker, etc.
 
-Todo está pensado para respuestas cortas y habladas (TTS), en español.
+Todo está pensado para respuestas cortas y habladas (TTS), en español. Las acciones con efecto lateral piden **confirmación** por voz (estilo Siri).
 
 ---
 
@@ -12,8 +12,8 @@ Todo está pensado para respuestas cortas y habladas (TTS), en español.
 |-------|-----|
 | **openWakeWord** | Detecta la wake word (`hey_jarvis`) |
 | **Silero VAD** | Detecta cuándo dejas de hablar |
-| **faster-whisper** | Speech-to-text |
-| **Ollama** (`llama3.2:3b`) | Razonamiento + function calling |
+| **faster-whisper** (`medium`) | Speech-to-text (más preciso; GPU recomendada) |
+| **Ollama** (`qwen2.5:3b` + `qwen2.5:14b`) | Intent/chat rápido; 14B solo para tools |
 | **Kokoro ONNX** | Text-to-speech en español |
 | **`tools/`** | Acciones locales sandboxed / con allowlist |
 
@@ -26,7 +26,8 @@ Todo está pensado para respuestas cortas y habladas (TTS), en español.
 - [Ollama](https://ollama.com) en marcha, con el modelo:
 
 ```bash
-ollama pull llama3.2:3b
+ollama pull qwen2.5:3b
+ollama pull qwen2.5:14b
 ```
 
 Opcional pero recomendado:
@@ -64,13 +65,14 @@ python assistant.py
 Verás mensajes de carga (wake word, VAD, Whisper). Cuando termine:
 
 ```text
-=== JARVIS EN ESPERA (Function Calling + Streaming activo) ===
+=== JARVIS EN ESPERA (intent router + tools + streaming) ===
 ```
 
 1. Di **“hey Jarvis”** (o la frase del modelo `hey_jarvis`).
-2. Cuando diga que te escucha, formula el pedido en español.
-3. Al detectar silencio, transcribe, llama a Ollama (y a tools si hace falta) y **lee la respuesta en voz alta**.
-4. Vuelve al modo espera.
+2. Jarvis responde al momento **“Sí, Fede?”** (el nombre se configura con `USER_NAME` en `assistant.py`).
+3. Formula el pedido; al detectar silencio, transcribe y clasifica intención con el modelo **rápido**.
+4. Charla → modelo rápido. Acciones/tools → modelo **14B**, confirmación si hace falta, y respuesta por voz.
+5. Vuelve al modo espera (historial corto de conversación).
 
 Para salir: `Ctrl+C`.
 
@@ -86,8 +88,11 @@ Para salir: `Ctrl+C`.
 En [`assistant.py`](assistant.py) puedes ajustar:
 
 - `ALLOWED_DATA_ROOT` — sandbox de archivos (por defecto el directorio del proyecto)
-- `LLM_MODEL` — modelo Ollama
+- `USER_NAME` — nombre en el acuse del wake word
+- `FAST_MODEL` — intent + chat (`qwen2.5:3b`)
+- `LLM_MODEL` — tools / resumen (`qwen2.5:14b`)
 - `CURSOR_WORKSPACE` / `CURSOR_MODEL`
+- `HISTORY_MAX_TURNS` — memoria corta de conversación
 
 ---
 
@@ -100,17 +105,23 @@ Micrófono
 Wake word (openWakeWord) ──► VAD + grabación
    │
    ▼
-Whisper (texto)
+Whisper (texto) ──► filtro STT (ruido / vacío → “repite”)
    │
    ▼
-Ollama (+ tools schema)
+Clasificador de intención (qwen2.5:3b, JSON)
    │
-   ├─ sin tools ──► respuesta directa ──► TTS (Kokoro)
+   ├─ chat / clarify ──► respuesta con 3B o “reformula” ──► TTS
    │
-   └─ con tool_calls ──► ejecuta tools/ ──► Ollama resume ──► TTS
+   └─ apps|files|code|… ──► qwen2.5:14b + subset de tools
+         │
+         ├─ sin tool_calls ──► respuesta ──► TTS
+         │
+         └─ 1 tool ──► ¿efecto lateral?
+               ├─ sí ──► confirmar por voz ──► ejecutar ──► resume 14B ──► TTS
+               └─ no ──► ejecutar ──► resume 14B ──► TTS
 ```
 
-Las tools se registran en [`tools/registry.py`](tools/registry.py). Cada una devuelve un **string corto** pensado para que Jarvis lo explique por voz.
+El router vive en [`tools/intent.py`](tools/intent.py). Las tools se registran en [`tools/registry.py`](tools/registry.py); `tools_for_intent` limita qué schemas ve el modelo en cada turno.
 
 **Límites de seguridad:**
 
@@ -119,6 +130,7 @@ Las tools se registran en [`tools/registry.py`](tools/registry.py). Cada una dev
 - Docker: sin `exec` / `rm` / `run` arbitrario; compose sin `down -v`
 - Docs web: solo hosts allowlisted
 - REPL Python: imports restringidos, timeout, sin disco ni red
+- Confirmación obligatoria en launch/write/cursor/scaffold y Docker/clipboard con efecto
 
 Cachés locales (embeddings, docs) van a `.jarvis_cache/` (ignorado por git).
 
@@ -126,20 +138,20 @@ Cachés locales (embeddings, docs) van a `.jarvis_cache/` (ignorado por git).
 
 ## Qué puedes pedirle (guía de uso)
 
-Habla en lenguaje natural. Jarvis elige la tool; no hace falta decir el nombre exacto, pero estos ejemplos ayudan.
+Habla en lenguaje natural. Jarvis clasifica la intención y elige la tool; no hace falta decir el nombre exacto, pero estos ejemplos ayudan.
 
 ### Archivos y código
 
 - *“Lista lo que hay en la carpeta tools”* → `list_directory`
 - *“Lee los archivos de notas”* → `read_directory_files`
-- *“Escribe un README en borrador.md con …”* → `write_file`
+- *“Escribe un README en borrador.md con …”* → `write_file` (pide confirmación)
 - *“Busca la función launch_app en el código”* → `search_codebase` (`text` / `regex`)
 - *“¿En qué archivos se menciona Docker?”* → `search_codebase` (`files_only`)
 - *“Busca código relacionado con el portapapeles”* → `search_codebase` (`semantic`, necesita embeddings)
 
 ### Entorno de trabajo
 
-- *“Abre Cursor en este proyecto”* / *“Abre VS Code”* → `launch_app`
+- *“Abre Cursor en este proyecto”* / *“Abre VS Code”* → `launch_app` (pide confirmación)
 - *“Enfoca el navegador”* → `focus_window`
 - *“Abre el navegador con el perfil de trabajo”* → `launch_app` + `profile=work`
 - Alias de workspace: por defecto `assistant` apunta al proyecto (configurable por env)
@@ -149,11 +161,11 @@ Habla en lenguaje natural. Jarvis elige la tool; no hace falta decir el nombre e
 - *“¿Qué hay en el portapapeles?”* / *“Copia este texto …”* → `manage_clipboard`
 - *“Añade al portapapeles …”* / *“Limpia el portapapeles”* / *“Historial del portapapeles”*
 - *“Pasa 25 grados Celsius a Fahrenheit”* → `exec_python_repl`  
-  (la sesión recuerda variables unos minutos; puedes pedir reset implícito con un cálculo nuevo limpio)
+  (la sesión recuerda variables unos minutos)
 
 ### Proyectos nuevos
 
-- *“Crea un proyecto FastAPI llamado api-demo”* → `scaffold_project`  
+- *“Crea un proyecto FastAPI llamado api-demo”* → `scaffold_project` (pide confirmación)  
   Plantillas: `python`, `nodejs`, `nextjs`, `micropython`, `fastapi`, `esp32`  
   Opcional: abrirlo en Cursor/VS Code tras crearlo (`open_in`)
 
@@ -162,20 +174,19 @@ Habla en lenguaje natural. Jarvis elige la tool; no hace falta decir el nombre e
 - *“Lista los contenedores”* → `list`
 - *“Muéstrame los últimos logs de mi-contenedor”* → `logs`
 - *“¿Cuánta CPU/memoria usan?”* → `stats`
-- *“Inspecciona / reinicia X”* → `inspect` / `restart` / `start` / `top`
-- Compose (fichero dentro del sandbox, p. ej. `docker-compose.yml`):  
-  *“Levanta el compose”*, *“logs del servicio web”*, *“baja el stack”*  
-  → `compose_up`, `compose_logs`, `compose_down`, etc.
+- *“Inspecciona / reinicia X”* → `inspect` / `restart` / `start` / `top`  
+  (`start` / `restart` / compose up-down piden confirmación)
+- Compose (fichero dentro del sandbox):  
+  *“Levanta el compose”*, *“logs del servicio web”*, *“baja el stack”*
 
 ### Documentación
 
 - *“Resúmeme la docs de FastAPI sobre dependency injection”* → `fetch_web_docs`  
-- Modo solo extracto (más rápido, sin resumen LLM): útil si solo quieres el texto  
 - Librerías con alias: `python`, `nextjs`, `react`, `docker`, `micropython`, `tailwind`, `kicad`, …
 
 ### Agente Cursor
 
-- *“Refactoriza X con el agente de Cursor”* → `run_cursor_agent`  
+- *“Refactoriza X con el agente de Cursor”* → `run_cursor_agent` (pide confirmación)  
   Requiere `CURSOR_API_KEY` y el SDK instalado. Por defecto la respuesta va **breve** (mejor para TTS).
 
 ---
@@ -183,9 +194,10 @@ Habla en lenguaje natural. Jarvis elige la tool; no hace falta decir el nombre e
 ## Estructura del repo (resumen)
 
 ```text
-assistant.py          # Bucle principal: audio + Ollama + TTS
+assistant.py          # Bucle: audio + intent + Ollama + confirmación + TTS
 tools/
-  registry.py         # Schemas y handlers de tools
+  intent.py           # Clasificador JSON + mapeo intent→tools + confirmación
+  registry.py         # Schemas, handlers, system prompt, tools_for_intent
   sandbox.py          # Rutas seguras
   common.py           # Truncado, skips, walk de archivos
   launch_app.py       # Abrir apps allowlisted
@@ -208,8 +220,10 @@ kokoro/               # Modelos TTS
 1. **Frases claras y una intención por turno** — el VAD corta al silencio; evita monólogos largos.
 2. **Nombres concretos** — contenedores Docker, carpetas y apps (“Cursor”, no “el editor”) mejoran el function calling.
 3. **Sandbox** — si pides algo fuera de `ALLOWED_DATA_ROOT`, Jarvis te dirá que no puede.
-4. **GPU** — Whisper está configurado con CUDA/`float16` en `assistant.py`; cámbialo a CPU/`int8` si no tienes NVIDIA.
+4. **GPU** — Whisper usa `medium` + CUDA/`float16` en `assistant.py` (más preciso que `small`). Si te falta VRAM, baja `WHISPER_MODEL_SIZE` a `small` o usa CPU/`int8`.
 5. **Voz** — las respuestas evitan markdown a propósito, para que el TTS suene natural.
+6. **Confirmación** — responde “sí” / “dale” o “no” / “cancelar” cuando Jarvis pregunte antes de actuar.
+7. **Micrófono** — habla tras el acuse, frases claras y sin ruido de fondo; el STT mejora mucho con buena entrada de audio.
 
 ---
 

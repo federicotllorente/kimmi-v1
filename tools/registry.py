@@ -9,6 +9,7 @@ from tools.cursor_agent import run_cursor_agent
 from tools.exec_python_repl import exec_python_repl
 from tools.fetch_web_docs import fetch_web_docs
 from tools.focus_window import focus_window
+from tools.intent import tool_names_for_intent
 from tools.launch_app import launch_app
 from tools.list_files import list_directory
 from tools.manage_clipboard import manage_clipboard
@@ -129,8 +130,9 @@ def build_tools(
             "function": {
                 "name": "read_directory_files",
                 "description": (
-                    "Lee el contenido de los archivos de texto dentro del directorio permitido "
-                    f"({allowed_root}) o de una subcarpeta suya."
+                    "SOLO si el usuario pide explícitamente leer el contenido de archivos "
+                    f"en el sandbox ({allowed_root}). NO usar para conversación general ni "
+                    "para solo listar nombres."
                 ),
                 "parameters": {
                     "type": "object",
@@ -148,7 +150,10 @@ def build_tools(
             "type": "function",
             "function": {
                 "name": "list_directory",
-                "description": f"Lista archivos y carpetas dentro de {allowed_root}.",
+                "description": (
+                    "SOLO si el usuario pide listar archivos o carpetas "
+                    f"dentro de {allowed_root}. NO usar para charla ni para leer contenido."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -167,8 +172,8 @@ def build_tools(
             "function": {
                 "name": "write_file",
                 "description": (
-                    "Escribe o crea un archivo de texto solo dentro del "
-                    f"directorio permitido ({allowed_root})."
+                    "SOLO si el usuario pide explícitamente crear o sobrescribir un archivo "
+                    f"de texto en {allowed_root}. NO usar para conversación ni borradores no pedidos."
                 ),
                 "parameters": {
                     "type": "object",
@@ -185,8 +190,9 @@ def build_tools(
             "function": {
                 "name": "run_cursor_agent",
                 "description": (
-                    "Delega una tarea de código al agente de Cursor (SDK local) sobre "
-                    f"{cursor_workspace}."
+                    "SOLO si el usuario pide explícitamente delegar una tarea de código al "
+                    f"agente de Cursor sobre {cursor_workspace}. NO para preguntas generales "
+                    "ni para editar sin haberlo pedido."
                 ),
                 "parameters": {
                     "type": "object",
@@ -206,8 +212,9 @@ def build_tools(
             "function": {
                 "name": "launch_app",
                 "description": (
-                    f"Abre una app allowlisted ({apps}). "
-                    "path puede ser carpeta, URL o alias de workspace (ej: assistant)."
+                    f"SOLO si el usuario pide abrir o lanzar una app allowlisted ({apps}). "
+                    "path puede ser carpeta, URL o alias (ej: assistant). "
+                    "NO usar si solo pregunta sobre apps o para enfocar una ya abierta."
                 ),
                 "parameters": {
                     "type": "object",
@@ -228,7 +235,10 @@ def build_tools(
             "type": "function",
             "function": {
                 "name": "focus_window",
-                "description": f"Enfoca una ventana abierta allowlisted ({apps}).",
+                "description": (
+                    f"SOLO si el usuario pide enfocar o traer al frente una ventana "
+                    f"allowlisted ya abierta ({apps}). NO para abrir apps nuevas."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -244,7 +254,9 @@ def build_tools(
             "function": {
                 "name": "manage_clipboard",
                 "description": (
-                    "Portapapeles: read, write, append, clear o history. Solo I/O de texto."
+                    "SOLO si el usuario pide leer, escribir, añadir, limpiar o ver el "
+                    "historial del portapapeles (read, write, append, clear, history). "
+                    "NO usar para conversación general."
                 ),
                 "parameters": {
                     "type": "object",
@@ -261,8 +273,9 @@ def build_tools(
             "function": {
                 "name": "exec_python_repl",
                 "description": (
-                    "Python restringido para cálculos/conversiones (sesión con TTL). "
-                    "Sin disco ni red. Ej: (c*9/5)+32 para °C a °F."
+                    "SOLO si el usuario pide un cálculo, conversión o evaluación numérica. "
+                    "Python restringido (sesión con TTL), sin disco ni red. "
+                    "NO usar para preguntas que no sean cálculo."
                 ),
                 "parameters": {
                     "type": "object",
@@ -279,8 +292,9 @@ def build_tools(
             "function": {
                 "name": "scaffold_project",
                 "description": (
-                    f"Crea scaffold ({templates}) solo dentro de {allowed_root}. "
-                    "open_in: cursor o vscode."
+                    f"SOLO si el usuario pide crear un proyecto nuevo ({templates}) "
+                    f"dentro de {allowed_root}. open_in: cursor o vscode. "
+                    "NO usar sin petición explícita de crear scaffold."
                 ),
                 "parameters": {
                     "type": "object",
@@ -299,7 +313,9 @@ def build_tools(
             "function": {
                 "name": "search_codebase",
                 "description": (
-                    "Busca en el código: mode text, regex, semantic o files_only."
+                    "SOLO si el usuario pide buscar en el código "
+                    "(mode text, regex, semantic o files_only). "
+                    "NO usar para charla ni para listar carpetas sin búsqueda."
                 ),
                 "parameters": {
                     "type": "object",
@@ -318,9 +334,10 @@ def build_tools(
             "function": {
                 "name": "manage_docker_container",
                 "description": (
-                    "Docker debug: list, inspect, start, restart, logs, stats, top, "
-                    "compose_ps, compose_logs, compose_up, compose_down, compose_restart. "
-                    "Compose solo bajo el sandbox."
+                    "SOLO si el usuario pide una acción Docker concreta: list, inspect, "
+                    "start, restart, logs, stats, top, compose_ps, compose_logs, "
+                    "compose_up, compose_down, compose_restart. Compose solo bajo el sandbox. "
+                    "NO usar para conversación sobre Docker sin acción."
                 ),
                 "parameters": {
                     "type": "object",
@@ -340,8 +357,9 @@ def build_tools(
             "function": {
                 "name": "fetch_web_docs",
                 "description": (
-                    "Docs web allowlisted. mode summary (default) o extract. "
-                    "Pasa url o library+topic (python, nextjs, micropython, tailwind, kicad, ...)."
+                    "SOLO si el usuario pide consultar documentación web allowlisted "
+                    "(mode summary o extract). Pasa url o library+topic. "
+                    "NO usar para preguntas generales sin pedir docs."
                 ),
                 "parameters": {
                     "type": "object",
@@ -375,21 +393,32 @@ def build_tools(
     return schema, handlers
 
 
+def tools_for_intent(intent: str, tools_schema: List[dict]) -> List[dict]:
+    """Filtra el schema completo al subset del intent clasificado."""
+    allowed = set(tool_names_for_intent(intent))
+    if not allowed:
+        return []
+    filtered: List[dict] = []
+    for entry in tools_schema:
+        name = entry.get("function", {}).get("name")
+        if name in allowed:
+            filtered.append(entry)
+    return filtered
+
+
 def build_system_prompt(allowed_root: str) -> str:
     apps = ", ".join(list_allowed_app_ids())
     return (
-        "Eres Jarvis, un asistente local conciso, directo y útil. "
-        "Responde siempre en español. Usa frases cortas y conversacionales (1 o 2 oraciones máximo). "
-        "Evita completamente el uso de caracteres Markdown (sin asteriscos, guiones o numerales) o "
-        "listas, ya que tu respuesta será leída por un sintetizador de voz. "
-        "Si no entiendes la pregunta, pide que reformule. "
+        "Eres Jarvis, un asistente local de voz: conciso, directo y útil. "
+        "Responde siempre en español con 1 o 2 oraciones conversacionales. "
+        "Sin markdown, asteriscos, guiones de lista ni numerales: tu respuesta se lee en voz alta. "
+        "DISCIPLINA DE HERRAMIENTAS: "
+        "Solo llama a una tool si el usuario pide una acción concreta "
+        "(abrir, listar, escribir, buscar en código, Docker, portapapeles, cálculo, docs). "
+        "Saludos, charla, opiniones o preguntas generales: responde SIN tools. "
+        "Si hay duda entre tools o faltan datos: pregunta, no ejecutes. "
+        "Prefiere cero tools a una incorrecta. Nunca inventes resultados de tools. "
         f"Archivos solo dentro de {allowed_root}. "
-        "Puedes delegar código a run_cursor_agent. "
-        f"Apps allowlisted: {apps} (launch_app/focus_window; path puede ser alias assistant). "
-        "Portapapeles: read, write, append, clear, history. "
-        "Python restringido con sesión (exec_python_repl). "
-        "Scaffold de proyectos y búsqueda con search_codebase "
-        "(mode text, regex, semantic o files_only). "
-        "Docker debug: logs, stats, top y compose_* sobre ficheros del sandbox. "
-        "Documentación web allowlisted con fetch_web_docs (summary o extract)."
+        f"Apps allowlisted: {apps}. "
+        "Usa como máximo una tool por turno."
     )
