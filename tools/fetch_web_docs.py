@@ -1,24 +1,31 @@
 """Descarga y resume documentación oficial de librerías/APIs.
 
-Solo hosts allowlisted. Extracto limpio + resumen corto vía Ollama.
-Requiere: stdlib + ollama (para el resumen).
+Solo hosts allowlisted. mode: summary (Ollama) | extract (solo texto).
+Caché en {allowed_root}/.jarvis_cache/docs/ (TTL 24h).
+Requiere: stdlib + ollama (para summary).
 """
 from __future__ import annotations
 
+import hashlib
 import html
 import ipaddress
+import json
+import os
 import re
 import socket
+import time
 from html.parser import HTMLParser
-from typing import List, Optional, Set, Tuple
-from urllib.error import HTTPError, URLError
+from typing import List, Set, Tuple
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
+
+from tools.common import ensure_cache_dir, truncate
 
 MAX_RESPONSE_BYTES = 500_000
 MAX_EXTRACT_CHARS = 4000
 MAX_OUTPUT_CHARS = 2000
 FETCH_TIMEOUT_SEC = 15
+CACHE_TTL_SEC = 24 * 60 * 60
 USER_AGENT = "JarvisDocsBot/1.0 (+local-assistant)"
 
 ALLOWED_HOSTS: Set[str] = {
@@ -42,9 +49,11 @@ ALLOWED_HOSTS: Set[str] = {
     "ollama.com",
     "github.com",
     "raw.githubusercontent.com",
+    "docs.micropython.org",
+    "tailwindcss.com",
+    "docs.kicad.org",
 }
 
-# library short-name -> docs base URL
 LIBRARY_DOCS = {
     "requests": "https://requests.readthedocs.io/en/latest/",
     "python": "https://docs.python.org/3/",
@@ -58,6 +67,9 @@ LIBRARY_DOCS = {
     "numpy": "https://numpy.org/doc/stable/",
     "pandas": "https://pandas.pydata.org/docs/",
     "mdn": "https://developer.mozilla.org/en-US/docs/Web",
+    "micropython": "https://docs.micropython.org/en/latest/",
+    "tailwind": "https://tailwindcss.com/docs",
+    "kicad": "https://docs.kicad.org/",
 }
 
 
@@ -91,8 +103,14 @@ def fetch_web_docs(
     library: str = "",
     topic: str = "",
     llm_model: str = "llama3.2:3b",
+    mode: str = "summary",
+    allowed_root: str = ".",
 ) -> str:
-    """Obtiene docs desde URL o library+topic; resume con Ollama."""
+    """Obtiene docs desde URL o library+topic."""
+    mode = (mode or "summary").strip().lower()
+    if mode not in ("summary", "extract"):
+        return "mode debe ser 'summary' o 'extract'."
+
     target = (url or "").strip()
     lib = (library or "").strip().lower()
     topic_s = (topic or "").strip()
@@ -105,7 +123,6 @@ def fetch_web_docs(
             known = ", ".join(sorted(LIBRARY_DOCS.keys()))
             return f"Librería desconocida. Conocidas: {known}. O pasa una url allowlisted."
         if topic_s:
-            # Búsqueda simple: unir topic al path / buscar en query
             safe_topic = re.sub(r"[^A-Za-z0-9._/-]+", "-", topic_s).strip("-")
             target = urljoin(base, safe_topic)
         else:
@@ -114,6 +131,10 @@ def fetch_web_docs(
     ok, reason = _validate_url(target)
     if not ok:
         return reason
+
+    cached = _read_cache(allowed_root, target, mode)
+    if cached:
+        return truncate(cached, MAX_OUTPUT_CHARS)
 
     try:
         body, final_url = _fetch(target)
@@ -129,9 +150,43 @@ def fetch_web_docs(
         return "La página no contiene texto extraíble."
 
     extract = extract[:MAX_EXTRACT_CHARS]
-    summary = _summarize(extract, llm_model, topic_s or lib or final_url)
-    output = f"Fuente: {final_url}\n\n{summary}"
-    return _truncate(output)
+
+    if mode == "extract":
+        output = f"Fuente: {final_url}\n\n{extract}"
+    else:
+        summary = _summarize(extract, llm_model, topic_s or lib or final_url)
+        output = f"Fuente: {final_url}\n\n{summary}"
+
+    _write_cache(allowed_root, target, mode, output)
+    return truncate(output, MAX_OUTPUT_CHARS)
+
+
+def _cache_path(allowed_root: str, url: str, mode: str) -> str:
+    digest = hashlib.sha256(f"{mode}:{url}".encode("utf-8")).hexdigest()[:32]
+    return os.path.join(ensure_cache_dir(allowed_root, "docs"), f"{digest}.json")
+
+
+def _read_cache(allowed_root: str, url: str, mode: str) -> str:
+    path = _cache_path(allowed_root, url, mode)
+    if not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if time.time() - float(data.get("ts", 0)) > CACHE_TTL_SEC:
+            return ""
+        return str(data.get("content") or "")
+    except Exception:
+        return ""
+
+
+def _write_cache(allowed_root: str, url: str, mode: str, content: str) -> None:
+    path = _cache_path(allowed_root, url, mode)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"ts": time.time(), "url": url, "mode": mode, "content": content}, f)
+    except Exception:
+        pass
 
 
 def _validate_url(url: str) -> Tuple[bool, str]:
@@ -150,7 +205,6 @@ def _validate_url(url: str) -> Tuple[bool, str]:
     if not _host_allowed(host):
         return False, f"Host no permitido: {host}."
 
-    # Bloquear IPs privadas / localhost
     try:
         infos = socket.getaddrinfo(host, None)
         for info in infos:
@@ -176,7 +230,6 @@ def _validate_url(url: str) -> Tuple[bool, str]:
 def _host_allowed(host: str) -> bool:
     if host in ALLOWED_HOSTS:
         return True
-    # Permitir subdominios de readthedocs.io y similares
     for allowed in ALLOWED_HOSTS:
         if host.endswith("." + allowed):
             return True
@@ -184,7 +237,10 @@ def _host_allowed(host: str) -> bool:
 
 
 def _fetch(url: str) -> Tuple[str, str]:
-    req = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,text/plain,*/*"})
+    req = Request(
+        url,
+        headers={"User-Agent": USER_AGENT, "Accept": "text/html,text/plain,*/*"},
+    )
     with urlopen(req, timeout=FETCH_TIMEOUT_SEC) as resp:
         final = resp.geturl()
         raw = resp.read(MAX_RESPONSE_BYTES + 1)
@@ -194,12 +250,10 @@ def _fetch(url: str) -> Tuple[str, str]:
         ctype = resp.headers.get_content_charset()
         if ctype:
             charset = ctype
-        text = raw.decode(charset, errors="replace")
-        return text, final
+        return raw.decode(charset, errors="replace"), final
 
 
 def _html_to_text(body: str) -> str:
-    # Si parece HTML, parsear; si no, devolver plano.
     if "<html" in body.lower() or "<body" in body.lower() or "<p" in body.lower():
         parser = _TextExtractor()
         try:
@@ -210,7 +264,6 @@ def _html_to_text(body: str) -> str:
         text = html.unescape(text)
     else:
         text = body
-    # Compactar blancos
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -236,7 +289,9 @@ def _summarize(extract: str, llm_model: str, focus: str) -> str:
             messages=[{"role": "user", "content": prompt}],
             keep_alive="24h",
         )
-        content = resp.get("message", {}).get("content", "") if isinstance(resp, dict) else ""
+        content = (
+            resp.get("message", {}).get("content", "") if isinstance(resp, dict) else ""
+        )
         if not content:
             content = getattr(getattr(resp, "message", None), "content", "") or ""
         content = str(content).strip()
@@ -246,9 +301,3 @@ def _summarize(extract: str, llm_model: str, focus: str) -> str:
         return f"Extracto (resumen falló: {e}):\n" + extract[:1200]
 
     return "Extracto:\n" + extract[:1200]
-
-
-def _truncate(text: str) -> str:
-    if len(text) > MAX_OUTPUT_CHARS:
-        return text[:MAX_OUTPUT_CHARS] + "... [truncado]"
-    return text

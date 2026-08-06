@@ -1,17 +1,23 @@
 import os
 from typing import Optional
 
+from tools.common import truncate
+
 MAX_RESULT_CHARS = 1500
+BRIEF_RESULT_CHARS = 800
+
 
 def run_cursor_agent(
     prompt: str,
     workspace: str,
     model: str,
     api_key: Optional[str] = None,
+    brief: bool = True,
 ) -> str:
     """Ejecuta un agente Cursor local one-shot (Agent.prompt) y devuelve un resumen.
 
     Requiere: pip install cursor-sdk y CURSOR_API_KEY en el entorno.
+    brief=True trunca más agresivo (~800) para TTS.
     """
     if not prompt or not prompt.strip():
         return "Debes indicar un prompt para el agente de Cursor."
@@ -59,8 +65,8 @@ def run_cursor_agent(
         text = str(text)
 
     text = text.strip()
-    if len(text) > MAX_RESULT_CHARS:
-        text = text[:MAX_RESULT_CHARS] + "..."
+    limit = BRIEF_RESULT_CHARS if brief else MAX_RESULT_CHARS
+    text = truncate(text, limit)
 
     if not text:
         return f"Agente Cursor terminó con estado '{status}' sin texto de respuesta."

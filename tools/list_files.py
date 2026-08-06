@@ -1,5 +1,6 @@
 import os
 
+from tools.common import filter_safe_dirnames
 from tools.sandbox import resolve_safe_path
 
 
@@ -20,17 +21,14 @@ def list_directory(path: str, allowed_root: str, recursive: bool = False) -> str
 
     if recursive:
         for dirpath, dirnames, filenames in os.walk(safe_path):
-            # Filtrar dirs que escapen del sandbox (symlinks).
-            safe_dirs = []
+            filter_safe_dirnames(dirpath, dirnames, allowed_root)
             for dirname in dirnames:
                 full = os.path.join(dirpath, dirname)
                 resolved, err = resolve_safe_path(full, allowed_root)
                 if err or resolved is None:
                     continue
-                safe_dirs.append(dirname)
                 rel = os.path.relpath(resolved, root)
                 entries.append(f"[dir] {rel}")
-            dirnames[:] = safe_dirs
 
             for filename in filenames:
                 full = os.path.join(dirpath, filename)

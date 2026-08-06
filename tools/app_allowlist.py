@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import shutil
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -61,6 +62,13 @@ APP_CATALOG: Dict[str, AppEntry] = {
 }
 
 
+# Aliases de workspace: clave corta → ruta. Env JARVIS_WORKSPACE_<ALIAS> tiene prioridad.
+# Ejemplo: JARVIS_WORKSPACE_ASSISTANT=C:\Users\...\ai-assistant-test
+WORKSPACE_ALIASES: Dict[str, str] = {
+    "assistant": os.path.realpath("."),
+}
+
+
 def list_allowed_app_ids() -> List[str]:
     return sorted(APP_CATALOG.keys())
 
@@ -71,9 +79,39 @@ def get_app(app_id: str) -> Optional[AppEntry]:
     return APP_CATALOG.get(app_id.strip().lower())
 
 
+def resolve_workspace_alias(name: str) -> Optional[str]:
+    """Resuelve un alias de workspace a ruta absoluta, o None si no existe."""
+    if not name:
+        return None
+    key = name.strip().lower()
+    env_key = "JARVIS_WORKSPACE_" + re.sub(r"[^A-Za-z0-9]+", "_", key).upper()
+    env_val = os.environ.get(env_key, "").strip()
+    if env_val:
+        return os.path.abspath(os.path.expanduser(env_val))
+    mapped = WORKSPACE_ALIASES.get(key)
+    if mapped:
+        return os.path.abspath(os.path.expanduser(mapped))
+    return None
+
+
+def browser_profile_args(profile: str) -> List[str]:
+    """Flags allowlisted para perfiles de navegador (default|work)."""
+    profile = (profile or "default").strip().lower()
+    if profile in ("", "default"):
+        return []
+    if profile == "work":
+        directory = (
+            os.environ.get("JARVIS_BROWSER_PROFILE_WORK", "").strip()
+            or "Profile 1"
+        )
+        return [f"--profile-directory={directory}"]
+    return []
+
+
 def _env_path(var_name: str) -> Optional[str]:
     value = os.environ.get(var_name, "").strip()
     return value or None
+
 
 
 def resolve_launch_command(app_id: str) -> Optional[List[str]]:

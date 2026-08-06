@@ -1,7 +1,7 @@
-"""Crea estructuras mínimas de proyecto (Next.js, MicroPython, Node.js, Python).
+"""Crea estructuras mínimas de proyecto.
 
-Solo escribe dentro de allowed_root (sandbox). Sin npx/npm create.
-Requiere: stdlib + tools.sandbox.
+Plantillas: nextjs, micropython, nodejs, python, fastapi, esp32.
+Solo escribe dentro de allowed_root. Sin git. open_in: cursor|vscode.
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import List, Tuple
 
 from tools.sandbox import resolve_safe_path
 
-TEMPLATES = ("nextjs", "micropython", "nodejs", "python")
+TEMPLATES = ("nextjs", "micropython", "nodejs", "python", "fastapi", "esp32")
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
@@ -20,13 +20,18 @@ def scaffold_project(
     name: str,
     allowed_root: str,
     parent_path: str = ".",
+    open_in: str = "",
 ) -> str:
     """Crea un proyecto desde plantilla embebida bajo el sandbox."""
     template = (template or "").strip().lower()
     name = (name or "").strip()
+    open_in = (open_in or "").strip().lower()
 
     if template not in TEMPLATES:
         return f"Plantilla no válida. Usa: {', '.join(TEMPLATES)}."
+
+    if open_in and open_in not in ("cursor", "vscode"):
+        return "open_in debe ser '' , 'cursor' o 'vscode'."
 
     if not name or not _NAME_RE.match(name):
         return (
@@ -60,8 +65,9 @@ def scaffold_project(
             full_safe, full_err = resolve_safe_path(full, allowed_root)
             if full_err:
                 return full_err
-            os.makedirs(os.path.dirname(full_safe), exist_ok=True)
-            # Directorios marcados con trailing slash en plantilla vía .gitkeep
+            parent = os.path.dirname(full_safe)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             with open(full_safe, "w", encoding="utf-8", newline="\n") as f:
                 f.write(content)
             created.append(rel)
@@ -71,26 +77,53 @@ def scaffold_project(
     root = os.path.realpath(allowed_root)
     rel_root = os.path.relpath(dest_safe, root)
     tree = "\n".join(f"  - {p}" for p in created)
-    return f"Proyecto '{template}' creado en {rel_root}:\n{tree}"
+    msg = f"Proyecto '{template}' creado en {rel_root}:\n{tree}"
+
+    if open_in:
+        from tools.launch_app import launch_app
+
+        open_msg = launch_app(open_in, path=dest_safe, focus_after=True)
+        msg = f"{msg}\n{open_msg}"
+
+    return msg
 
 
 def _template_files(template: str, name: str) -> List[Tuple[str, str]]:
     if template == "python":
         return [
-            (
-                "README.md",
-                f"# {name}\n\nProyecto Python generado por Jarvis.\n",
-            ),
+            ("README.md", f"# {name}\n\nProyecto Python generado por Jarvis.\n"),
             (
                 "main.py",
-                'def main() -> None:\n    print("Hello from {name}")\n\n\nif __name__ == "__main__":\n    main()\n'.format(
-                    name=name
+                (
+                    f'def main() -> None:\n    print("Hello from {name}")\n\n\n'
+                    'if __name__ == "__main__":\n    main()\n'
                 ),
             ),
             ("requirements.txt", ""),
             (
                 ".gitignore",
                 "__pycache__/\n*.py[cod]\n.venv/\nvenv/\n.env\n*.egg-info/\ndist/\nbuild/\n",
+            ),
+        ]
+
+    if template == "fastapi":
+        return [
+            ("README.md", f"# {name}\n\nAPI FastAPI generada por Jarvis.\n\n```bash\npip install -r requirements.txt\nuvicorn main:app --reload\n```\n"),
+            (
+                "main.py",
+                (
+                    "from fastapi import FastAPI\n\n"
+                    "app = FastAPI(title=" + repr(name) + ")\n\n"
+                    '@app.get("/")\ndef root():\n'
+                    '    return {"message": "Hello from ' + name + '"}\n\n'
+                    '@app.get("/health")\ndef health():\n'
+                    '    return {"status": "ok"}\n'
+                ),
+            ),
+            ("requirements.txt", "fastapi>=0.115.0\nuvicorn[standard]>=0.30.0\n"),
+            (
+                ".gitignore",
+                "__pycache__/\n*.py[cod]\n.venv/\nvenv/\n.env\n",
             ),
         ]
 
@@ -104,20 +137,12 @@ def _template_files(template: str, name: str) -> List[Tuple[str, str]]:
                     '  "version": "1.0.0",\n'
                     '  "private": true,\n'
                     '  "main": "index.js",\n'
-                    '  "scripts": {\n'
-                    '    "start": "node index.js"\n'
-                    "  }\n"
+                    '  "scripts": { "start": "node index.js" }\n'
                     "}\n"
                 ),
             ),
-            (
-                "index.js",
-                f'console.log("Hello from {name}");\n',
-            ),
-            (
-                "README.md",
-                f"# {name}\n\nProyecto Node.js generado por Jarvis.\n",
-            ),
+            ("index.js", f'console.log("Hello from {name}");\n'),
+            ("README.md", f"# {name}\n\nProyecto Node.js generado por Jarvis.\n"),
             (".gitignore", "node_modules/\n.env\nnpm-debug.log*\n"),
         ]
 
@@ -175,7 +200,10 @@ def _template_files(template: str, name: str) -> List[Tuple[str, str]]:
                     "}\n"
                 ),
             ),
-            ("next.config.js", "/** @type {import('next').NextConfig} */\nconst nextConfig = {};\nmodule.exports = nextConfig;\n"),
+            (
+                "next.config.js",
+                "/** @type {import('next').NextConfig} */\nconst nextConfig = {};\nmodule.exports = nextConfig;\n",
+            ),
             (
                 "app/layout.tsx",
                 (
@@ -189,7 +217,7 @@ def _template_files(template: str, name: str) -> List[Tuple[str, str]]:
                     "  children: React.ReactNode;\n"
                     "}) {\n"
                     "  return (\n"
-                    "    <html lang=\"en\">\n"
+                    '    <html lang="en">\n'
                     "      <body>{children}</body>\n"
                     "    </html>\n"
                     "  );\n"
@@ -200,7 +228,7 @@ def _template_files(template: str, name: str) -> List[Tuple[str, str]]:
                 "app/page.tsx",
                 (
                     "export default function Home() {\n"
-                    f'  return <main><h1>{name}</h1></main>;\n'
+                    f"  return <main><h1>{name}</h1></main>;\n"
                     "}\n"
                 ),
             ),
@@ -211,6 +239,40 @@ def _template_files(template: str, name: str) -> List[Tuple[str, str]]:
             (".gitignore", "node_modules/\n.next/\nout/\n.env*\n"),
         ]
 
+    if template == "esp32":
+        return [
+            (
+                "boot.py",
+                (
+                    "# ESP32 MicroPython boot\n"
+                    "import gc\n"
+                    "gc.collect()\n"
+                ),
+            ),
+            (
+                "main.py",
+                (
+                    "from machine import Pin\n"
+                    "import time\n\n"
+                    "led = Pin(2, Pin.OUT)\n\n"
+                    "def main():\n"
+                    f'    print("Hello from {name} on ESP32")\n'
+                    "    while True:\n"
+                    "        led.value(1)\n"
+                    "        time.sleep(0.5)\n"
+                    "        led.value(0)\n"
+                    "        time.sleep(0.5)\n\n"
+                    'if __name__ == "__main__":\n'
+                    "    main()\n"
+                ),
+            ),
+            ("lib/.gitkeep", ""),
+            (
+                "README.md",
+                f"# {name}\n\nProyecto MicroPython para ESP32 generado por Jarvis.\n",
+            ),
+        ]
+
     # micropython
     return [
         (
@@ -218,17 +280,11 @@ def _template_files(template: str, name: str) -> List[Tuple[str, str]]:
             (
                 "def main():\n"
                 f'    print("Hello from {name} (MicroPython)")\n\n'
-                "if __name__ == \"__main__\":\n"
+                'if __name__ == "__main__":\n'
                 "    main()\n"
             ),
         ),
-        (
-            "boot.py",
-            "# Runs on every boot before main.py\n",
-        ),
-        (
-            "README.md",
-            f"# {name}\n\nProyecto MicroPython generado por Jarvis.\n",
-        ),
+        ("boot.py", "# Runs on every boot before main.py\n"),
+        ("README.md", f"# {name}\n\nProyecto MicroPython generado por Jarvis.\n"),
         ("lib/.gitkeep", ""),
     ]

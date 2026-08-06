@@ -1,42 +1,78 @@
 """Lee o escribe texto en el portapapeles del sistema.
 
+Acciones: read | write | append | clear | history.
 Preferencia: pyperclip si está instalado; fallback Win32 vía ctypes.
 Requiere: opcionalmente `pip install pyperclip`.
 """
 from __future__ import annotations
 
 import platform
-from typing import Optional
+import time
+from collections import deque
+from typing import Deque, Optional
+
+from tools.common import truncate
 
 MAX_READ_CHARS = 2000
 MAX_WRITE_BYTES = 50 * 1024
+HISTORY_SIZE = 5
+HISTORY_ENTRY_CHARS = 200
+
+_HISTORY: Deque[str] = deque(maxlen=HISTORY_SIZE)
+_ALLOWED = ("read", "write", "append", "clear", "history")
 
 
 def manage_clipboard(action: str, text: str = "") -> str:
-    """action: 'read' | 'write'."""
+    """Gestiona el portapapeles (solo I/O; no inyecta teclas)."""
     action = (action or "").strip().lower()
-    if action not in ("read", "write"):
-        return "Acción no válida. Usa 'read' o 'write'."
+    if action not in _ALLOWED:
+        return f"Acción no válida. Usa: {', '.join(_ALLOWED)}."
 
-    if action == "write":
-        if text is None:
-            return "Debes indicar el texto a escribir en el portapapeles."
-        payload = text.encode("utf-8")
-        if len(payload) > MAX_WRITE_BYTES:
-            return f"Texto demasiado grande (máximo {MAX_WRITE_BYTES} bytes)."
-        err = _set_clipboard(text)
+    if action == "history":
+        if not _HISTORY:
+            return "Historial de portapapeles vacío."
+        lines = []
+        for i, item in enumerate(reversed(_HISTORY), start=1):
+            lines.append(f"{i}. {truncate(item, HISTORY_ENTRY_CHARS)}")
+        return "Historial reciente:\n" + "\n".join(lines)
+
+    if action == "clear":
+        err = _set_clipboard("")
         if err:
             return err
-        return f"Portapapeles actualizado ({len(payload)} bytes)."
+        return "Portapapeles vaciado."
 
-    content, err = _get_clipboard()
+    if action == "read":
+        content, err = _get_clipboard()
+        if err:
+            return err
+        if content is None or content == "":
+            return "El portapapeles está vacío o no contiene texto."
+        return truncate(content, MAX_READ_CHARS)
+
+    # write | append
+    if text is None:
+        return "Debes indicar el texto."
+
+    payload_text = text
+    if action == "append":
+        current, err = _get_clipboard()
+        if err:
+            return err
+        current = current or ""
+        payload_text = current + text
+
+    payload = payload_text.encode("utf-8")
+    if len(payload) > MAX_WRITE_BYTES:
+        return f"Texto demasiado grande (máximo {MAX_WRITE_BYTES} bytes)."
+
+    err = _set_clipboard(payload_text)
     if err:
         return err
-    if content is None:
-        return "El portapapeles está vacío o no contiene texto."
-    if len(content) > MAX_READ_CHARS:
-        return content[:MAX_READ_CHARS] + "... [truncado]"
-    return content if content else "El portapapeles está vacío."
+
+    _HISTORY.append(payload_text)
+    verb = "añadido" if action == "append" else "actualizado"
+    return f"Portapapeles {verb} ({len(payload)} bytes)."
 
 
 def _set_clipboard(text: str) -> Optional[str]:
@@ -98,7 +134,13 @@ def _win_set_clipboard(text: str) -> Optional[str]:
         CF_UNICODETEXT = 13
         GMEM_MOVEABLE = 0x0002
 
-        if not user32.OpenClipboard(None):
+        opened = False
+        for _ in range(5):
+            if user32.OpenClipboard(None):
+                opened = True
+                break
+            time.sleep(0.05)
+        if not opened:
             return "No se pudo abrir el portapapeles."
         try:
             user32.EmptyClipboard()
@@ -115,7 +157,6 @@ def _win_set_clipboard(text: str) -> Optional[str]:
             if not user32.SetClipboardData(CF_UNICODETEXT, handle):
                 kernel32.GlobalFree(handle)
                 return "SetClipboardData falló."
-            # Ownership transferred to the clipboard; do not free handle.
         finally:
             user32.CloseClipboard()
         return None
@@ -147,7 +188,13 @@ def _win_get_clipboard() -> tuple:
         if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
             return None, None
 
-        if not user32.OpenClipboard(None):
+        opened = False
+        for _ in range(5):
+            if user32.OpenClipboard(None):
+                opened = True
+                break
+            time.sleep(0.05)
+        if not opened:
             return None, "No se pudo abrir el portapapeles."
         try:
             handle = user32.GetClipboardData(CF_UNICODETEXT)

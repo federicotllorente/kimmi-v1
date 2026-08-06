@@ -1,20 +1,28 @@
 """Evalúa código Python restringido (cálculos, conversiones, lógica rápida).
 
-Ejecuta en subproceso con timeout. Solo imports de módulos allowlisted.
+Ejecuta en subproceso con timeout. Sesión de variables JSON-serializables con TTL.
+Ejemplos: (c*9/5)+32  # °C→°F;  1024**3  # bytes.
 Requiere: stdlib (usa el mismo intérprete `sys.executable`).
 """
 from __future__ import annotations
 
 import ast
+import json
+import os
 import re
 import subprocess
 import sys
 import tempfile
-import os
+import time
+from typing import Any, Dict
+
+from tools.common import truncate
 
 TIMEOUT_SEC = 5
 MAX_CODE_CHARS = 4000
 MAX_OUTPUT_CHARS = 2000
+SESSION_TTL_SEC = 15 * 60
+SESSION_MARKER = "__JARVIS_SESSION__="
 
 ALLOWED_MODULES = frozenset(
     {
@@ -57,9 +65,23 @@ _BLOCKED_PATTERNS = [
     re.compile(r"\bctypes\b"),
 ]
 
+# Valores JSON-serializables compartidos entre llamadas.
+_SESSION: Dict[str, Any] = {}
+_SESSION_TS: float = 0.0
 
-def exec_python_repl(code: str) -> str:
+
+def exec_python_repl(code: str, reset_session: bool = False) -> str:
     """Ejecuta código Python seguro y devuelve stdout/stderr truncado."""
+    global _SESSION, _SESSION_TS
+
+    if reset_session:
+        _SESSION = {}
+        _SESSION_TS = 0.0
+
+    if _SESSION and (time.time() - _SESSION_TS) > SESSION_TTL_SEC:
+        _SESSION = {}
+        _SESSION_TS = 0.0
+
     if not code or not str(code).strip():
         return "Debes indicar código Python a evaluar."
 
@@ -95,7 +117,7 @@ def exec_python_repl(code: str) -> str:
             if node.value.id in ("__builtins__", "__builtin__"):
                 return "Código rechazado: acceso a builtins no permitido."
 
-    runner = _build_runner_script(source)
+    runner = _build_runner_script(source, _SESSION)
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
@@ -133,33 +155,47 @@ def exec_python_repl(code: str) -> str:
 
     out = (completed.stdout or "").strip()
     err = (completed.stderr or "").strip()
+
+    # Extraer sesión serializada
+    out_lines = out.splitlines() if out else []
+    cleaned = []
+    for line in out_lines:
+        if line.startswith(SESSION_MARKER):
+            try:
+                data = json.loads(line[len(SESSION_MARKER) :])
+                if isinstance(data, dict):
+                    _SESSION = data
+                    _SESSION_TS = time.time()
+            except json.JSONDecodeError:
+                pass
+        else:
+            cleaned.append(line)
+    out = "\n".join(cleaned).strip()
+
     if completed.returncode != 0:
         msg = err or out or f"Falló con código {completed.returncode}."
-        return _truncate(f"Error: {msg}")
+        return truncate(f"Error: {msg}", MAX_OUTPUT_CHARS)
 
     if not out and not err:
         return "Ejecutado sin salida."
     if err and out:
-        return _truncate(f"{out}\n[stderr]: {err}")
-    return _truncate(out or err)
+        return truncate(f"{out}\n[stderr]: {err}", MAX_OUTPUT_CHARS)
+    return truncate(out or err, MAX_OUTPUT_CHARS)
 
 
-def _truncate(text: str) -> str:
-    if len(text) > MAX_OUTPUT_CHARS:
-        return text[:MAX_OUTPUT_CHARS] + "... [truncado]"
-    return text
-
-
-def _build_runner_script(user_code: str) -> str:
+def _build_runner_script(user_code: str, session: Dict[str, Any]) -> str:
     """Envuelve el código del usuario en un namespace mínimo con prints del último expr."""
-    # Si la última sentencia es una expresión, imprimir su valor (estilo REPL).
     try:
         tree = ast.parse(user_code, mode="exec")
         if tree.body and isinstance(tree.body[-1], ast.Expr):
             last = tree.body[-1]
             expr_code = ast.unparse(last.value)
             body_nodes = tree.body[:-1]
-            preamble = ast.unparse(ast.Module(body=body_nodes, type_ignores=[])) if body_nodes else ""
+            preamble = (
+                ast.unparse(ast.Module(body=body_nodes, type_ignores=[]))
+                if body_nodes
+                else ""
+            )
             parts = []
             if preamble.strip():
                 parts.append(preamble)
@@ -172,8 +208,12 @@ def _build_runner_script(user_code: str) -> str:
         wrapped_user = user_code
 
     allowed = ", ".join(repr(m) for m in sorted(ALLOWED_MODULES))
+    session_json = json.dumps(session, ensure_ascii=False)
+    marker = SESSION_MARKER
+
     return f'''# Auto-generated restricted runner
 import builtins as _b
+import json as _json
 
 _ALLOWED = {{{allowed}}}
 _orig_import = _b.__import__
@@ -200,5 +240,17 @@ _safe_builtins = {{
 }}
 
 _ns = {{"__builtins__": _safe_builtins}}
+_ns.update(_json.loads({session_json!r}))
 exec(compile({wrapped_user!r}, "<repl>", "exec"), _ns)
+
+_serial = {{}}
+for _k, _v in list(_ns.items()):
+    if _k.startswith("_") or _k == "__builtins__":
+        continue
+    try:
+        _json.dumps(_v)
+        _serial[_k] = _v
+    except (TypeError, ValueError):
+        pass
+print({marker!r} + _json.dumps(_serial, ensure_ascii=False))
 '''
