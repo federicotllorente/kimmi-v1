@@ -19,6 +19,15 @@ from tools.list_files import list_directory
 from tools.search_files import search_files
 from tools.write_file import write_file
 from tools.cursor_agent import run_cursor_agent
+from tools.launch_app import launch_app
+from tools.focus_window import focus_window
+from tools.manage_clipboard import manage_clipboard
+from tools.exec_python_repl import exec_python_repl
+from tools.scaffold_project import scaffold_project
+from tools.search_codebase import search_codebase
+from tools.manage_docker_container import manage_docker_container
+from tools.fetch_web_docs import fetch_web_docs
+from tools.app_allowlist import list_allowed_app_ids
 
 # --- CONFIGURACIÓN DE PARÁMETROS ---
 FORMAT = pyaudio.paInt16
@@ -166,6 +175,209 @@ tools_schema = [
             },
         },
     },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'launch_app',
+            'description': (
+                'Abre una aplicación permitida del entorno de trabajo. '
+                f"Apps: {', '.join(list_allowed_app_ids())}."
+            ),
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'app_id': {
+                        'type': 'string',
+                        'description': 'Identificador: vscode, cursor, browser o terminal.',
+                    },
+                    'path': {
+                        'type': 'string',
+                        'description': (
+                            'Opcional: carpeta de proyecto (vscode/cursor/terminal) '
+                            'o URL http(s) (browser).'
+                        ),
+                    },
+                },
+                'required': ['app_id'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'focus_window',
+            'description': (
+                'Enfoca una ventana ya abierta de una app permitida '
+                f"({', '.join(list_allowed_app_ids())}) o por substring de título."
+            ),
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'app_id': {
+                        'type': 'string',
+                        'description': 'vscode, cursor, browser o terminal.',
+                    },
+                    'title_substring': {
+                        'type': 'string',
+                        'description': 'Texto que debe aparecer en el título de la ventana.',
+                    },
+                },
+                'required': [],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'manage_clipboard',
+            'description': 'Lee o escribe texto en el portapapeles del sistema.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'action': {
+                        'type': 'string',
+                        'description': "Acción: 'read' o 'write'.",
+                    },
+                    'text': {
+                        'type': 'string',
+                        'description': 'Texto a escribir (obligatorio si action=write).',
+                    },
+                },
+                'required': ['action'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'exec_python_repl',
+            'description': (
+                'Evalúa cálculos, conversiones o lógica rápida en Python restringido '
+                '(sin disco ni red). Solo imports seguros: math, decimal, datetime, json, re, etc.'
+            ),
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'code': {
+                        'type': 'string',
+                        'description': 'Código Python corto a evaluar.',
+                    },
+                },
+                'required': ['code'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'scaffold_project',
+            'description': (
+                'Crea la estructura inicial de un proyecto (nextjs, micropython, nodejs o python) '
+                f'solo dentro de {ALLOWED_DATA_ROOT}.'
+            ),
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'template': {
+                        'type': 'string',
+                        'description': 'Plantilla: nextjs, micropython, nodejs o python.',
+                    },
+                    'name': {
+                        'type': 'string',
+                        'description': 'Nombre de la carpeta del proyecto.',
+                    },
+                    'parent_path': {
+                        'type': 'string',
+                        'description': 'Carpeta padre relativa al sandbox (por defecto ".").',
+                    },
+                },
+                'required': ['template', 'name'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'search_codebase',
+            'description': (
+                'Busca en el código del sandbox con ripgrep (regex) o embeddings Ollama (semantic).'
+            ),
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'query': {
+                        'type': 'string',
+                        'description': 'Patrón regex o consulta semántica.',
+                    },
+                    'mode': {
+                        'type': 'string',
+                        'description': "'regex' (por defecto) o 'semantic'.",
+                    },
+                    'path': {
+                        'type': 'string',
+                        'description': 'Subcarpeta relativa donde buscar (por defecto ".").',
+                    },
+                    'glob': {
+                        'type': 'string',
+                        'description': 'Filtro glob opcional (ej: "*.py").',
+                    },
+                },
+                'required': ['query'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'manage_docker_container',
+            'description': (
+                'Lista, inspecciona, inicia o reinicia contenedores Docker '
+                '(sin exec, rm ni run arbitrario).'
+            ),
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'action': {
+                        'type': 'string',
+                        'description': "Acción: 'list', 'inspect', 'start' o 'restart'.",
+                    },
+                    'container': {
+                        'type': 'string',
+                        'description': 'Nombre o id del contenedor (salvo action=list).',
+                    },
+                },
+                'required': ['action'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'fetch_web_docs',
+            'description': (
+                'Descarga y resume documentación oficial de librerías/APIs desde hosts allowlisted '
+                '(docs.python.org, nextjs.org, MDN, etc.). Pasa url o library+topic.'
+            ),
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'url': {
+                        'type': 'string',
+                        'description': 'URL de documentación allowlisted.',
+                    },
+                    'library': {
+                        'type': 'string',
+                        'description': 'Alias corto (python, nextjs, react, docker, requests, ...).',
+                    },
+                    'topic': {
+                        'type': 'string',
+                        'description': 'Tema o ruta relativa dentro de la docs de la librería.',
+                    },
+                },
+                'required': [],
+            },
+        },
+    },
 ]
 
 
@@ -195,12 +407,48 @@ def _run_cursor_agent_wrapped(prompt: str) -> str:
     )
 
 
+def _scaffold_project_sandboxed(template: str, name: str, parent_path: str = ".") -> str:
+    return scaffold_project(
+        template,
+        name,
+        allowed_root=ALLOWED_DATA_ROOT,
+        parent_path=parent_path,
+    )
+
+
+def _search_codebase_sandboxed(
+    query: str,
+    mode: str = "regex",
+    path: str = ".",
+    glob: str = "",
+) -> str:
+    return search_codebase(
+        query,
+        allowed_root=ALLOWED_DATA_ROOT,
+        mode=mode,
+        path=path,
+        glob=glob,
+    )
+
+
+def _fetch_web_docs_wrapped(url: str = "", library: str = "", topic: str = "") -> str:
+    return fetch_web_docs(url=url, library=library, topic=topic, llm_model=LLM_MODEL)
+
+
 available_tools = {
     'read_directory_files': _read_directory_files_sandboxed,
     'list_directory': _list_directory_sandboxed,
     'search_files': _search_files_sandboxed,
     'write_file': _write_file_sandboxed,
     'run_cursor_agent': _run_cursor_agent_wrapped,
+    'launch_app': launch_app,
+    'focus_window': focus_window,
+    'manage_clipboard': manage_clipboard,
+    'exec_python_repl': exec_python_repl,
+    'scaffold_project': _scaffold_project_sandboxed,
+    'search_codebase': _search_codebase_sandboxed,
+    'manage_docker_container': manage_docker_container,
+    'fetch_web_docs': _fetch_web_docs_wrapped,
 }
 
 # --- INICIALIZACIÓN DE COMPONENTES ---
@@ -421,7 +669,11 @@ def main():
                         "Tienes herramientas locales para listar, buscar, leer y escribir archivos solo dentro del "
                         f"directorio permitido ({ALLOWED_DATA_ROOT}) y sus subcarpetas. "
                         "Si el usuario pide algo fuera de ahí, dile que no tienes permiso para acceder a esa ruta. "
-                        "También puedes delegar tareas de código al agente de Cursor con run_cursor_agent."
+                        "También puedes delegar tareas de código al agente de Cursor con run_cursor_agent. "
+                        f"Puedes abrir o enfocar apps allowlisted ({', '.join(list_allowed_app_ids())}), "
+                        "leer o escribir el portapapeles, evaluar Python restringido, crear scaffolds de proyecto, "
+                        "buscar en el codebase (regex o semántico), gestionar contenedores Docker "
+                        "(list, inspect, start, restart) y consultar documentación web allowlisted."
                     )
                     
                     messages = [
