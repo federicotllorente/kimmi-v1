@@ -4,6 +4,7 @@ import wave
 import subprocess
 import numpy as np
 import pyaudio
+import torch
 import ollama
 from openwakeword.model import Model
 from faster_whisper import WhisperModel
@@ -12,11 +13,13 @@ from faster_whisper import WhisperModel
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
-CHUNK = 1280  # Tamaño recomendado para openWakeWord (80ms a 16kHz)
+# Silero VAD requiere tamaños de chunk específicos para 16kHz (512, 1024 o 1536 muestras)
+VAD_CHUNK = 512  # ~32 ms por chunk
+OWW_CHUNK = 1280 # ~80 ms por chunk para openWakeWord
 
 WAKE_WORD_THRESHOLD = 0.5
-SILENCE_DURATION_SEC = 2.0  # Segundos de silencio para cortar la grabación
-RECORD_TIMEOUT = 10         # Tiempo máximo de escucha tras el wake word
+SILENCE_LIMIT_SEC = 0.8  # Segundos de silencio continuo para cortar grabación
+MAX_RECORD_SEC = 15.0    # Tiempo máximo de grabación de seguridad
 
 # Rutas de modelos
 # PIPER_EXE = "piper"  # O la ruta absoluta a tu ejecutable de piper: "C:/piper/piper.exe"
@@ -31,6 +34,14 @@ oww_model = Model(
   inference_framework="onnx"
 )
 
+print("Cargando Silero VAD...")
+vad_model, _ = torch.hub.load(
+    repo_or_dir='snakers4/silero-vad',
+    model='silero_vad',
+    force_reload=False,
+    onnx=False
+)
+
 print("Cargando Faster-Whisper (STT)...")
 # Usa "cuda" y "float16" si tienes GPU NVIDIA, o "cpu" e "int8" si ejecutas en procesador
 whisper_model = WhisperModel("tiny", device="cuda", compute_type="float16")
@@ -41,12 +52,6 @@ def play_tts(text: str):
     """Sintetiza texto a voz usando Piper y reproduce el audio."""
     if not text.strip():
         return
-    
-    cmd_piper = [
-        PIPER_EXE,
-        "--model", PIPER_MODEL,
-        "--output-raw"
-    ]
     
     # Redirigimos la salida de Piper directamente a PyAudio mediante aplay / ffplay / subprocess
     # Para simplicidad multiplataforma, guardamos un WAV temporal si no usas aplay/paplay:
@@ -76,17 +81,45 @@ def play_tts(text: str):
     p_out.terminate()
     wf.close()
 
-def record_user_audio(stream) -> bytes:
-    """Graba el audio del usuario tras detectar la palabra de activación."""
+def record_user_audio_vad(stream) -> bytes:
+    """Graba audio dinámicamente cortando al detectar silencio post-habla."""
     print("\n[Jarvis]: Te escucho...")
     frames = []
+    has_spoken = False
+    silent_chunks = 0
     
-    # Grabación simple por tiempo fijado (100 frames aprox ~8 seg)
-    # En producción se sustituye por Silero VAD para detectar fin de habla
-    for _ in range(0, int(RATE / CHUNK * 6)):
-        data = stream.read(CHUNK, exception_on_overflow=False)
+    chunk_duration_sec = VAD_CHUNK / RATE
+    max_silent_chunks = int(SILENCE_LIMIT_SEC / chunk_duration_sec)
+    max_total_chunks = int(MAX_RECORD_SEC / chunk_duration_sec)
+    
+    total_chunks = 0
+    vad_model.reset_states() # Reinicia la memoria recurrente del modelo VAD
+    
+    while total_chunks < max_total_chunks:
+        data = stream.read(VAD_CHUNK, exception_on_overflow=False)
         frames.append(data)
+        total_chunks += 1
         
+        # Convertir bytes int16 a Tensor Float32 normalizado [-1.0, 1.0]
+        audio_int16 = np.frombuffer(data, dtype=np.int16)
+        audio_float32 = audio_int16.astype(np.float32) / 32768.0
+        tensor_chunk = torch.from_numpy(audio_float32)
+        
+        # Obtener probabilidad de presencia de voz (0.0 a 1.0)
+        speech_prob = vad_model(tensor_chunk, RATE).item()
+        
+        if speech_prob > 0.5:
+            if not has_spoken:
+                print("  [VAD]: Voz detectada...")
+                has_spoken = True
+            silent_chunks = 0
+        else:
+            if has_spoken:
+                silent_chunks += 1
+                if silent_chunks >= max_silent_chunks:
+                    print("  [VAD]: Fin de intervención por silencio.")
+                    break
+                    
     return b''.join(frames)
 
 def transcribe_audio(audio_bytes: bytes) -> str:
@@ -100,8 +133,7 @@ def transcribe_audio(audio_bytes: bytes) -> str:
     
     wav_buffer.seek(0)
     segments, _ = whisper_model.transcribe(wav_buffer, language="es")
-    text = " ".join([segment.text for segment in segments]).strip()
-    return text
+    return " ".join([segment.text for segment in segments]).strip()
 
 # --- BUCLE PRINCIPAL ---
 def main():
@@ -110,10 +142,10 @@ def main():
         channels=CHANNELS,
         rate=RATE,
         input=True,
-        frames_per_buffer=CHUNK
+        frames_per_buffer=OWW_CHUNK
     )
     
-    print("\n=== JARVIS EN ESPERA (Di la palabra clave o activa openWakeWord) ===")
+    print("\n=== JARVIS EN ESPERA (Escuchando Wake Word) ===")
     
     try:
         while True:
@@ -126,22 +158,23 @@ def main():
             
             # Comprobación de activación (ej: modelo por defecto como "alexa" o "hey_jarvis")
             scores = list(prediction.values())
+            
             if any(score >= WAKE_WORD_THRESHOLD for score in scores):
                 print("\n[Wake Word Detectado!]")
                 
-                # 2. Captura de la consulta de voz
-                user_audio_bytes = record_user_audio(mic_stream)
+                # 2. Grabación dinámica mediante Silero VAD
+                user_audio_bytes = record_user_audio_vad(mic_stream)
                 
                 # 3. Transcripción (STT)
                 user_text = transcribe_audio(user_audio_bytes)
                 print(f"[Tú]: {user_text}")
                 
                 if user_text:
-                    # 4. Inferencia con Ollama (LLM)
+                    # 4. Procesamiento LLM (Ollama)
                     system_prompt = (
                         "Eres Jarvis, un asistente local conciso, directo y útil. "
                         "Responde siempre en español. Sé muy breve y conversacional (1 o 2 oraciones máximo) "
-                        "evitando formateo Markdown o listas, ya que tu respuesta será leída por un sintetizador de voz."
+                        "sin formateo Markdown o listas, ya que tu respuesta será leída por un sintetizador de voz."
                     )
                     
                     response = ollama.chat(
