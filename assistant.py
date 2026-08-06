@@ -3,6 +3,8 @@ import io
 import json
 import random
 import re
+import subprocess
+import time
 import wave
 import queue
 import threading
@@ -15,7 +17,6 @@ import torch
 import ollama
 from openwakeword.model import Model
 from faster_whisper import WhisperModel
-from kokoro_onnx import Kokoro
 import sounddevice as sd
 
 from tools.app_allowlist import list_allowed_app_ids
@@ -37,6 +38,8 @@ VAD_CHUNK = 512  # ~32 ms por chunk
 OWW_CHUNK = 1280  # ~80 ms por chunk para openWakeWord
 
 WAKE_WORD_THRESHOLD = 0.5
+# Tras TTS / fin de turno, ignorar wake word (eco del altavoz en el mic).
+WAKE_COOLDOWN_SEC = 1.25
 SILENCE_LIMIT_SEC = 1.0  # Un poco más de margen para no cortar a mitad de frase
 MAX_RECORD_SEC = 15.0  # Tiempo máximo de grabación de seguridad
 # Conservar un poco de audio antes de detectar voz (evita cortar la primera sílaba)
@@ -57,14 +60,24 @@ CURSOR_WORKSPACE = os.path.realpath("./")
 CURSOR_MODEL = "composer-2.5"
 
 PIPER_EXE = "proj-env/Scripts/piper"
-PIPER_MODEL = "es_MX-claude-high.onnx"
+PIPER_MODEL = "piper/es_MX-claude-high.onnx"
+
+# TTS: "kokoro" o "piper" — cambia esta variable para probar uno u otro.
+TTS_ENGINE = "kokoro"
+KOKORO_VOICE = "ef_dora"
+KOKORO_SPEED = 1.2
+KOKORO_MODEL = "kokoro/kokoro-v1_0.onnx"
+KOKORO_VOICES = "kokoro/voices-v1_0.bin"
+# Silencio al inicio/final (ms) para que el altavoz no corte la primera sílaba.
+KOKORO_LEAD_IN_MS = 120
+KOKORO_TRAIL_MS = 40
 
 # Nombre del usuario para el acuse del wake word.
 USER_NAME = "Fede"
 
 # Feature flags
 ENABLE_INTENT_ROUTER = False  # Clasificar intent antes de responder (añade latencia)
-ENABLE_TOOLS = True  # Function calling / acciones locales
+ENABLE_TOOLS = False  # Function calling / acciones locales
 
 # Variantes del acuse; usa {name} donde quieras el nombre.
 WAKE_ACK_PHRASES = [
@@ -132,7 +145,19 @@ STT_INITIAL_PROMPT = (
     "Apps: " + ", ".join(list_allowed_app_ids()) + "."
 )
 
-kokoro = Kokoro("kokoro/kokoro-v1_0.onnx", "kokoro/voices-v1_0.bin")
+# --- TTS (carga solo el motor elegido) ---
+TTS_ENGINE = TTS_ENGINE.strip().lower()
+if TTS_ENGINE not in ("kokoro", "piper"):
+    raise ValueError(f"TTS_ENGINE inválido: {TTS_ENGINE!r}. Usa 'kokoro' o 'piper'.")
+
+kokoro = None
+if TTS_ENGINE == "kokoro":
+    from kokoro_onnx import Kokoro
+
+    print(f"Cargando Kokoro TTS ({KOKORO_VOICE})...")
+    kokoro = Kokoro(KOKORO_MODEL, KOKORO_VOICES)
+else:
+    print(f"Usando Piper TTS ({PIPER_MODEL})...")
 
 # --- TOOLS (FUNCTION CALLING) ---
 tools_schema, available_tools = build_tools(
@@ -168,52 +193,116 @@ whisper_model = WhisperModel(
 
 audio = pyaudio.PyAudio()
 
-# NO BORRAR ESTE COMENTARIO
-# --- REPRODUCCIÓN Y SÍNTESIS DE AUDIO (PIPER TTS) ---
-# def play_tts_sentence(text: str):
-#     """Sintetiza texto a voz usando Piper y reproduce el audio."""
-#     if not text.strip():
-#         return
-    
-#     # Redirigimos la salida de Piper directamente a PyAudio mediante aplay / ffplay / subprocess
-#     # Para simplicidad multiplataforma, guardamos un WAV temporal si no usas aplay/paplay:
-#     wav_output = "temp_sentence.wav"
-#     cmd_piper = [PIPER_EXE, "--model", PIPER_MODEL, "--output_file", wav_output]
-    
-#     # Genera el archivo de audio para la oración actual
-#     process = subprocess.Popen(cmd_piper, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
-#     process.communicate(input=text)
-    
-#     if not os.path.exists(wav_output):
-#         return
+# Timestamp monotonic hasta el cual se ignoran wake words (anti-eco TTS).
+_wake_ignore_until = 0.0
 
-#     # Reproducir WAV generado
-#     wf = wave.open(wav_output, 'rb')
-#     p_out = pyaudio.PyAudio()
-#     stream_out = p_out.open(
-#         format=p_out.get_format_from_width(wf.getsampwidth()),
-#         channels=wf.getnchannels(),
-#         rate=wf.getframerate(),
-#         output=True
-#     )
-    
-#     data = wf.readframes(1024)
-#     while len(data) > 0:
-#         stream_out.write(data)
-#         data = wf.readframes(1024)
-        
-#     stream_out.stop_stream()
-#     stream_out.close()
-#     p_out.terminate()
-#     wf.close()
 
-# --- REPRODUCCIÓN Y SÍNTESIS DE AUDIO (KOKORO TTS) ---
-def play_tts_sentence(text: str):
+def suppress_wake_word(seconds: float = WAKE_COOLDOWN_SEC) -> None:
+    """Bloquea detección de wake word durante N segundos."""
+    global _wake_ignore_until
+    _wake_ignore_until = max(_wake_ignore_until, time.monotonic() + seconds)
+
+
+def wake_word_suppressed() -> bool:
+    return time.monotonic() < _wake_ignore_until
+
+
+def flush_mic_stream(stream, max_chunks: int = 25) -> None:
+    """Vacía audio encolado en el mic (eco residual del TTS)."""
+    for _ in range(max_chunks):
+        try:
+            available = stream.get_read_available()
+        except Exception:
+            break
+        if available < OWW_CHUNK:
+            break
+        stream.read(OWW_CHUNK, exception_on_overflow=False)
+
+
+def reset_wake_word_model() -> None:
+    """Limpia buffers internos de openWakeWord tras un turno/TTS."""
+    try:
+        buf = getattr(oww_model, "prediction_buffer", None)
+        if isinstance(buf, dict):
+            for key in list(buf.keys()):
+                buf[key] = []
+    except Exception:
+        pass
+
+
+# --- REPRODUCCIÓN Y SÍNTESIS DE AUDIO ---
+def play_tts_piper(text: str):
+    """Sintetiza texto a voz con Piper y reproduce el WAV."""
     if not text.strip():
         return
-    samples, sample_rate = kokoro.create(text, voice="ef_dora", speed=1.2, lang="es")
-    sd.play(samples, sample_rate)
-    sd.wait()
+
+    wav_output = "temp_sentence.wav"
+    cmd_piper = [PIPER_EXE, "--model", PIPER_MODEL, "--output_file", wav_output]
+    process = subprocess.Popen(
+        cmd_piper,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    process.communicate(input=text)
+    if process.returncode != 0 or not os.path.exists(wav_output):
+        print(f"  [TTS Piper]: error sintetizando (code={process.returncode})")
+        return
+
+    wf = wave.open(wav_output, "rb")
+    p_out = pyaudio.PyAudio()
+    stream_out = p_out.open(
+        format=p_out.get_format_from_width(wf.getsampwidth()),
+        channels=wf.getnchannels(),
+        rate=wf.getframerate(),
+        output=True,
+    )
+    data = wf.readframes(1024)
+    while len(data) > 0:
+        stream_out.write(data)
+        data = wf.readframes(1024)
+    stream_out.stop_stream()
+    stream_out.close()
+    p_out.terminate()
+    wf.close()
+
+
+def play_tts_kokoro(text: str):
+    """Sintetiza texto a voz con Kokoro y reproduce."""
+    if not text.strip() or kokoro is None:
+        return
+    samples, sample_rate = kokoro.create(
+        text,
+        voice=KOKORO_VOICE,
+        speed=KOKORO_SPEED,
+        lang="es",
+    )
+    waveform = np.asarray(samples, dtype=np.float32)
+    if waveform.ndim > 1:
+        waveform = waveform.reshape(-1)
+
+    # Padding de silencio: el dispositivo a menudo “despierta” tarde y corta el ataque.
+    lead = int(sample_rate * (KOKORO_LEAD_IN_MS / 1000.0))
+    trail = int(sample_rate * (KOKORO_TRAIL_MS / 1000.0))
+    if lead > 0 or trail > 0:
+        waveform = np.concatenate([
+            np.zeros(max(lead, 0), dtype=np.float32),
+            waveform,
+            np.zeros(max(trail, 0), dtype=np.float32),
+        ])
+
+    sd.play(waveform, sample_rate, blocking=True)
+
+
+def play_tts_sentence(text: str):
+    """Despacha al motor TTS configurado en TTS_ENGINE."""
+    if TTS_ENGINE == "piper":
+        play_tts_piper(text)
+    else:
+        play_tts_kokoro(text)
+    # Tras hablar, el mic suele captar el eco → no aceptar wake word un momento.
+    suppress_wake_word(WAKE_COOLDOWN_SEC)
 
 
 def tts_worker(sentence_queue: queue.Queue):
@@ -621,13 +710,17 @@ def main():
         f"Rápido: {FAST_MODEL} | Pesado: {LLM_MODEL} | Usuario: {USER_NAME}"
     )
     print(
-        f"Flags: INTENT_ROUTER={ENABLE_INTENT_ROUTER} | TOOLS={ENABLE_TOOLS}"
+        f"Flags: INTENT_ROUTER={ENABLE_INTENT_ROUTER} | TOOLS={ENABLE_TOOLS} | TTS={TTS_ENGINE}"
     )
 
     try:
         while True:
             data = mic_stream.read(OWW_CHUNK, exception_on_overflow=False)
             audio_data = np.frombuffer(data, dtype=np.int16)
+
+            # Durante/tras TTS no evaluamos wake word (evita falsos positivos por eco).
+            if wake_word_suppressed():
+                continue
 
             prediction = oww_model.predict(audio_data)
             scores = list(prediction.values())
@@ -642,6 +735,9 @@ def main():
 
                 if not stt_ok:
                     speak_text("No te escuché bien, ¿puedes repetir?")
+                    flush_mic_stream(mic_stream)
+                    reset_wake_word_model()
+                    suppress_wake_word(WAKE_COOLDOWN_SEC)
                     print("\n=== Volviendo a estado de espera ===")
                     continue
 
@@ -660,6 +756,10 @@ def main():
                 if len(conversation_history) > max_msgs:
                     conversation_history[:] = conversation_history[-max_msgs:]
 
+                # Anti-eco: vaciar mic + cooldown antes de volver a escuchar wake word.
+                flush_mic_stream(mic_stream)
+                reset_wake_word_model()
+                suppress_wake_word(WAKE_COOLDOWN_SEC)
                 print("\n=== Volviendo a estado de espera ===")
 
     except KeyboardInterrupt:
