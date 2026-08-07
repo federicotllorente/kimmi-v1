@@ -7,12 +7,13 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
-from typing import Optional
+from typing import Deque, Optional, Tuple
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
-# idle | listening | processing | responding | error
+# idle | listening | processing | responding | starting | error
 PipelineState = str
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +36,9 @@ _ERROR_MARKERS = (
     "RuntimeError:",
 )
 
+_VOWELS = set("aeiouáéíóúüAEIOUÁÉÍÓÚÜ")
+_SPEECH_MARKERS = ("[Jarvis]:", "[Confirmación]:")
+
 
 def parse_engine_line(line: str) -> Optional[tuple[PipelineState, str]]:
     """Map engine stdout markers to pipeline state. Returns (state, message) or None."""
@@ -48,12 +52,26 @@ def parse_engine_line(line: str) -> Optional[tuple[PipelineState, str]]:
     if "JARVIS EN ESPERA" in text or "Volviendo a estado de espera" in text:
         return "idle", text
 
-    if "[Wake Word Detectado" in text or "[VAD]:" in text:
+    if (
+        "[Wake Word Detectado" in text
+        or "[VAD]:" in text
+        or "Escuchando (sesión activa)" in text
+        or "Usando audio del barge-in" in text
+    ):
         return "listening", text
 
     if any(
         marker in text
-        for marker in ("[Tú]:", "[Intent]:", "[LLM]:", "[Tools]:", "[Cierre]:")
+        for marker in (
+            "[Tú]:",
+            "[Intent]:",
+            "[LLM]:",
+            "[Tools]:",
+            "[Cierre]:",
+            "[Sesión]:",
+            "[Memoria]:",
+            "[RAG Memoria]:",
+        )
     ):
         return "processing", text
 
@@ -66,29 +84,67 @@ def parse_engine_line(line: str) -> Optional[tuple[PipelineState, str]]:
     return None
 
 
+def _char_burst(ch: str) -> float:
+    """Approximate spoken intensity for one character (Spanish-ish)."""
+    if ch.isspace():
+        return 0.04
+    if ch in ",.;:…—-":
+        return 0.06
+    if ch in "!?¡¿":
+        return 0.95
+    if ch in _VOWELS:
+        return 0.72 + random.uniform(0.0, 0.22)
+    if ch.isdigit():
+        return 0.42
+    # consonants / other
+    return 0.28 + random.uniform(0.0, 0.32)
+
+
+def _char_duration(ch: str) -> float:
+    """Rough TTS pacing so streamed text is stretched toward spoken timing."""
+    if ch.isspace():
+        return 0.075
+    if ch in ".!?¡¿":
+        return 0.20
+    if ch in ",.;:":
+        return 0.11
+    return 0.052
+
+
 class EngineBridge(QObject):
     """Runs the voice engine as a subprocess and emits status for the HUD."""
 
     status_updated = Signal(str, float, str)  # state, amplitude, message
     _state_from_engine = Signal(str, str)  # state, message (queued from reader thread)
+    _speech_text = Signal(str)  # spoken text delta (queued from reader thread)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
-        self.state: PipelineState = "idle"
-        self.message: str = ""
-        self.amplitude: float = 0.08
-        self._proc: Optional[subprocess.Popen[str]] = None
+        self.state: PipelineState = "starting"
+        self.message: str = "Starting engine..."
+        self.amplitude: float = 0.0
+        self._proc: Optional[subprocess.Popen] = None
         self._reader_thread: Optional[threading.Thread] = None
         self._running = False
         self._stopping = False
+        self._ready = False
         self._t0 = time.monotonic()
+
+        # Text→speech envelope (main thread only).
+        self._burst_queue: Deque[Tuple[float, float]] = deque()
+        self._next_burst_at = 0.0
+        self._speech_until = 0.0
+        self._speech_energy = 0.0
+        self._speech_gate = 0.0  # smooth 0..1 open/close
+
         self._amp_timer = QTimer(self)
-        self._amp_timer.setInterval(50)  # ~20 Hz
+        self._amp_timer.setInterval(33)  # ~30 Hz envelope
         self._amp_timer.timeout.connect(self._tick_amplitude)
         self._watch_timer = QTimer(self)
         self._watch_timer.setInterval(500)
         self._watch_timer.timeout.connect(self._watch_process)
         self._state_from_engine.connect(self._apply_state)
+        self._speech_text.connect(self._ingest_speech)
 
     @property
     def is_alive(self) -> bool:
@@ -106,14 +162,21 @@ class EngineBridge(QObject):
 
         self._stopping = False
         self._running = True
+        self._ready = False
         self._t0 = time.monotonic()
-        self.state = "idle"
+        self.state = "starting"
         self.message = "Starting engine..."
-        self.amplitude = 0.08
+        self.amplitude = 0.0
+        self._burst_queue.clear()
+        self._next_burst_at = 0.0
+        self._speech_until = 0.0
+        self._speech_energy = 0.0
+        self._speech_gate = 0.0
 
         env = os.environ.copy()
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUNBUFFERED"] = "1"
 
         creationflags = 0
         if sys.platform == "win32":
@@ -121,14 +184,11 @@ class EngineBridge(QObject):
 
         try:
             self._proc = subprocess.Popen(
-                [str(ENGINE_PYTHON), str(ENGINE_SCRIPT)],
+                [str(ENGINE_PYTHON), "-u", str(ENGINE_SCRIPT)],
                 cwd=str(ENGINE_DIR),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
+                bufsize=0,
                 env=env,
                 creationflags=creationflags,
             )
@@ -173,12 +233,14 @@ class EngineBridge(QObject):
         print(f"[desktop] {message}", flush=True)
         self._running = False
         self._watch_timer.stop()
-        # Keep amplitude timer so the red wave still breathes.
         if not self._amp_timer.isActive():
             self._amp_timer.start()
+        self._burst_queue.clear()
+        self._speech_energy = 0.0
+        self._speech_gate = 0.0
         self.state = "error"
         self.message = message
-        self.amplitude = 0.2
+        self.amplitude = 0.0
         self._emit()
 
     def _emit(self) -> None:
@@ -189,17 +251,51 @@ class EngineBridge(QObject):
         )
 
     def _apply_state(self, state: PipelineState, message: str = "") -> None:
-        # Once in error (unexpected), keep it until restart — except intentional stop.
         if self.state == "error" and state != "error" and not self._stopping:
             if message:
                 self.message = message
             return
+
+        # Stay in starting until the engine prints ready (ignore other chatter while loading).
+        if not self._ready:
+            if state == "idle" and "JARVIS EN ESPERA" in (message or ""):
+                self._ready = True
+                state = "idle"
+            elif state == "error":
+                pass
+            else:
+                # Keep showing the boot loader; refresh message if useful.
+                if message and message != self.message:
+                    self.message = message
+                    self._emit()
+                return
+
         changed = state != self.state or (message and message != self.message)
         self.state = state
         if message:
             self.message = message
         if changed:
             self._emit()
+
+    def _ingest_speech(self, text: str) -> None:
+        """Queue character bursts paced like speech (main thread)."""
+        if not text:
+            return
+        now = time.monotonic()
+        t = max(now, self._next_burst_at)
+        for ch in text:
+            if ch == "\r":
+                continue
+            if ch == "\n":
+                t += 0.12
+                continue
+            self._burst_queue.append((t, _char_burst(ch)))
+            t += _char_duration(ch)
+        self._next_burst_at = t
+        # Hold the gate a bit past the last scheduled burst (TTS lag after tokens).
+        self._speech_until = max(self._speech_until, t + 0.45)
+        if self.state != "error":
+            self.state = "responding"
 
     def _watch_process(self) -> None:
         if self._stopping or not self._running:
@@ -210,35 +306,77 @@ class EngineBridge(QObject):
         code = proc.poll()
         if code is None:
             return
-        # Process exited while we still expected it to run.
         if code == 0:
             self._fail("Engine exited unexpectedly")
         else:
             self._fail(f"Engine crashed (exit code {code})")
 
     def _read_stdout_thread(self) -> None:
+        """Read engine stdout in chunks so streaming prints (no newline) are live."""
         proc = self._proc
         if not proc or not proc.stdout:
             return
 
+        pending = ""
+        active_marker: Optional[str] = None
+        ingested = 0
+
         try:
-            for line in proc.stdout:
-                if not self._running:
+            while self._running:
+                chunk = proc.stdout.read(256)
+                if not chunk:
                     break
-                print(f"[engine] {line.rstrip()}", flush=True)
-                parsed = parse_engine_line(line)
-                if parsed:
-                    state, message = parsed
-                    self._state_from_engine.emit(state, message)
+                text = chunk.decode("utf-8", errors="replace")
+                print(text, end="", flush=True)
+                pending += text
+
+                if active_marker is None:
+                    for marker in _SPEECH_MARKERS:
+                        if marker in pending:
+                            active_marker = marker
+                            start = pending.find(marker) + len(marker)
+                            content = pending[start:]
+                            ingested = 0
+                            preview = pending.replace("\n", " ").strip()[-120:]
+                            self._state_from_engine.emit("responding", preview)
+                            if content:
+                                self._speech_text.emit(content)
+                                ingested = len(content)
+                            break
+                else:
+                    start = pending.find(active_marker) + len(active_marker)
+                    if start >= len(active_marker):
+                        content = pending[start:]
+                        if len(content) > ingested:
+                            self._speech_text.emit(content[ingested:])
+                            ingested = len(content)
+
+                while "\n" in pending:
+                    line, pending = pending.split("\n", 1)
+                    active_marker = None
+                    ingested = 0
+                    parsed = parse_engine_line(line)
+                    if parsed:
+                        state, message = parsed
+                        self._state_from_engine.emit(state, message)
         except Exception as exc:
-            print(f"[desktop] Engine stdout reader error: {exc}", flush=True)
+            print(f"\n[desktop] Engine stdout reader error: {exc}", flush=True)
             if self._running and not self._stopping:
                 self._state_from_engine.emit("error", f"Engine stdout error: {exc}")
         finally:
+            if pending.strip():
+                print(flush=True)
+                parsed = parse_engine_line(pending)
+                if parsed and self._running and not self._stopping:
+                    state, message = parsed
+                    self._state_from_engine.emit(state, message)
+
             if self._running and not self._stopping:
-                # Prefer exit-code watch for the final message; this covers pipe EOF early.
                 proc = self._proc
-                if proc is not None and proc.poll() is not None and proc.returncode not in (0, None):
+                if proc is not None and proc.poll() is not None and proc.returncode not in (
+                    0,
+                    None,
+                ):
                     self._state_from_engine.emit(
                         "error",
                         f"Engine crashed (exit code {proc.returncode})",
@@ -250,16 +388,34 @@ class EngineBridge(QObject):
         if not self._running and self.state != "error":
             return
 
-        t = time.monotonic() - self._t0
-        state = self.state
+        now = time.monotonic()
 
-        if state == "responding":
-            target = 0.55 + 0.35 * abs(math.sin(t * 5.5)) + random.uniform(0, 0.1)
-        elif state == "error":
-            target = 0.05
+        if self.state == "error":
+            self.amplitude = 0.0
+            self._emit()
+            return
+
+        # Apply due character bursts → speech energy contour.
+        while self._burst_queue and self._burst_queue[0][0] <= now:
+            _, burst = self._burst_queue.popleft()
+            self._speech_energy = min(1.0, self._speech_energy * 0.35 + burst)
+
+        # Soft decay between bursts (syllable falloff).
+        self._speech_energy *= 0.88
+
+        speaking = bool(self._burst_queue) or now < self._speech_until or self._speech_energy > 0.05
+        target_gate = 1.0 if speaking else 0.0
+        # Asymmetric smoothing: faster attack, slower release (no hard cuts).
+        if target_gate > self._speech_gate:
+            self._speech_gate += (target_gate - self._speech_gate) * 0.22
         else:
-            # Flat line unless the assistant is speaking.
-            target = 0.0
+            self._speech_gate += (target_gate - self._speech_gate) * 0.07
 
-        self.amplitude = self.amplitude * 0.55 + min(1.0, max(0.0, target)) * 0.45
+        if self._speech_gate < 0.01:
+            self._speech_gate = 0.0
+            self._speech_energy = 0.0
+
+        # Contour rides on the gate so flat↔active blends smoothly.
+        contour = 0.12 + 0.88 * self._speech_energy
+        self.amplitude = max(0.0, min(1.0, self._speech_gate * contour))
         self._emit()
