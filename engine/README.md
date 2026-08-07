@@ -76,11 +76,12 @@ Verás mensajes de carga (wake word, VAD, Whisper). Cuando termine:
 === KIMMI EN ESPERA (intent router + tools + streaming) ===
 ```
 
-1. Di **“Hey Kimmi”** (o la frase del modelo `hey_kee_me`).
-2. Kimmi responde al momento **“Sí, Fede?”** (el nombre se configura con `USER_NAME` en `assistant.py`).
+1. Di **“Hey Kimmi”** (o la frase del modelo `hey_kee_me`), o el pedido en la misma frase (**“Hey Kimmi, qué tal estás?”**): si hay habla justo después de la wake word, Kimmi no dice el acuse y transcribe el comando pegado (pre-roll + continuación).
+2. Si solo llamas a Kimmi (silencio después), responde al momento **“Sí, Fede?”** (el nombre se configura con `USER_NAME` en `assistant.py`) y escucha.
 3. Formula el pedido; al detectar silencio, transcribe y clasifica intención con el modelo **rápido**.
 4. Charla → modelo rápido. Acciones/tools → modelo **14B**, confirmación si hace falta, y respuesta por voz.
-5. Vuelve al modo espera (historial corto de conversación).
+5. Tras responder, la sesión sigue activa un rato (sin repetir la wake word) hasta un cierre (“gracias”, etc.) o silencio.
+6. Vuelve al modo espera (historial corto de conversación).
 
 Para salir: `Ctrl+C`.
 

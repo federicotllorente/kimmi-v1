@@ -43,6 +43,12 @@ OWW_CHUNK = 1280  # ~80 ms por chunk para openWakeWord
 WAKE_WORD_THRESHOLD = 0.5
 # Tras TTS / fin de turno, ignorar wake word (eco del altavoz en el mic).
 WAKE_COOLDOWN_SEC = 1.25
+# Pre-roll mientras esperamos wake word (comando pegado: "Hey Kimmi, …").
+WAKE_RING_BUFFER_SEC = 2.0
+# Ventana post-wake para decidir si el usuario sigue hablando (sin acuse TTS).
+WAKE_FOLLOW_SPEECH_SEC = 0.5
+# Últimos N segundos del ring a inspeccionar con VAD.
+WAKE_TAIL_SPEECH_SEC = 0.7
 # Tras responder, seguir escuchando sin wake word hasta cierre o silencio.
 CONVERSATION_MODE = True
 # Segundos de silencio (sin voz) para cerrar la sesión en turnos de seguimiento.
@@ -51,6 +57,13 @@ SILENCE_LIMIT_SEC = 1.0  # Un poco más de margen para no cortar a mitad de fras
 MAX_RECORD_SEC = 15.0  # Tiempo máximo de grabación de seguridad
 # Conservar un poco de audio antes de detectar voz (evita cortar la primera sílaba)
 VAD_PRE_ROLL_SEC = 0.3
+
+# Variantes de la wake phrase a quitar del transcript (STT).
+_WAKE_PHRASE_RE = re.compile(
+    r"^\s*(?:(?:hey|ey|ok|okay|hola)\s+)?(?:kimmi|kimi|kee\s*me|quimi)"
+    r"(?:\s*[,.!?]+\s*|\s+|\s*$)",
+    re.IGNORECASE,
+)
 
 HISTORY_MAX_TURNS = 6  # pares user/assistant ≈ 12 mensajes
 MIN_TRANSCRIPT_CHARS = 3
@@ -215,8 +228,10 @@ tools_schema, available_tools = build_tools(
 # --- INICIALIZACIÓN DE COMPONENTES ---
 print("Cargando modelo Wake Word...")
 oww_model = Model(
-    # wakeword_models=["hey_jarvis"],
-    wakeword_models=["oww/hey_kee_me.onnx"],
+    wakeword_models=[
+        "oww/hey_kee_me.onnx",  # "Hey Kimmi"
+        "oww/kee_me.onnx",      # "Kimmi"
+    ],
     inference_framework="onnx",
 )
 
@@ -275,6 +290,124 @@ def reset_wake_word_model() -> None:
                 buf[key] = []
     except Exception:
         pass
+
+
+def _iter_vad_chunks(audio_bytes: bytes):
+    """Parte PCM int16 mono en chunks del tamaño que espera Silero VAD."""
+    step = VAD_CHUNK * 2  # int16 → 2 bytes/muestra
+    for i in range(0, len(audio_bytes) - step + 1, step):
+        yield audio_bytes[i : i + step]
+
+
+def _vad_has_speech(audio_bytes: bytes, threshold: float = 0.5) -> bool:
+    """True si algún chunk del audio supera el umbral VAD."""
+    if not audio_bytes or len(audio_bytes) < VAD_CHUNK * 2:
+        return False
+    vad_model.reset_states()
+    for chunk in _iter_vad_chunks(audio_bytes):
+        audio_int16 = np.frombuffer(chunk, dtype=np.int16)
+        audio_float32 = audio_int16.astype(np.float32) / 32768.0
+        speech_prob = float(vad_model(torch.from_numpy(audio_float32), RATE).item())
+        if speech_prob > threshold:
+            return True
+    return False
+
+
+def _audio_tail(audio_bytes: bytes, seconds: float) -> bytes:
+    """Últimos N segundos de PCM int16 mono."""
+    max_bytes = int(seconds * RATE) * 2
+    if max_bytes <= 0 or len(audio_bytes) <= max_bytes:
+        return audio_bytes
+    # Alinear a muestra (2 bytes).
+    max_bytes -= max_bytes % 2
+    return audio_bytes[-max_bytes:]
+
+
+def speech_continues_after_wake(
+    seed_bytes: bytes,
+    stream,
+) -> Tuple[bool, bytes]:
+    """Decide si hay comando pegado tras la wake word.
+
+    1) VAD sobre los últimos WAKE_TAIL_SPEECH_SEC del ring.
+    2) Siempre lee WAKE_FOLLOW_SPEECH_SEC del mic (bytes acumulados).
+    3) continues si hay habla en el peek (fiable) o, si el peek es silencio,
+       no usamos el tail solo (la wake word vive ahí y daría falsos positivos).
+
+    Devuelve (continues, peeked_bytes).
+    """
+    tail = _audio_tail(seed_bytes, WAKE_TAIL_SPEECH_SEC)
+    tail_speech = _vad_has_speech(tail, threshold=0.5)
+
+    peek_chunks = max(1, int(WAKE_FOLLOW_SPEECH_SEC / (VAD_CHUNK / RATE)))
+    peeked_parts: List[bytes] = []
+    vad_model.reset_states()
+    peek_speech = False
+    for _ in range(peek_chunks):
+        data = stream.read(VAD_CHUNK, exception_on_overflow=False)
+        peeked_parts.append(data)
+        audio_int16 = np.frombuffer(data, dtype=np.int16)
+        audio_float32 = audio_int16.astype(np.float32) / 32768.0
+        speech_prob = float(vad_model(torch.from_numpy(audio_float32), RATE).item())
+        if speech_prob > 0.5:
+            peek_speech = True
+
+    peeked = b"".join(peeked_parts)
+    # Peek decide el acuse. El tail se registra para diagnóstico.
+    if peek_speech:
+        continues = True
+    elif tail_speech:
+        # Habla en el buffer pero silencio justo después del trigger → solo wake.
+        print("  [Wake]: habla en buffer, silencio post-trigger → acuse")
+        continues = False
+    else:
+        continues = False
+    return continues, peeked
+
+
+def strip_wake_phrase(text: str) -> str:
+    """Quita 'Hey Kimmi' (y variantes) del inicio del transcript."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+    stripped = _WAKE_PHRASE_RE.sub("", cleaned, count=1).strip()
+    stripped = re.sub(r"^[,.\s]+", "", stripped).strip()
+    return stripped
+
+
+def _apply_seed_audio_to_recording(
+    seed_audio: bytes,
+    frames: List[bytes],
+    pre_roll: deque,
+) -> Tuple[bool, int]:
+    """Incorpora audio previo al estado de grabación VAD.
+
+    Devuelve (has_spoken, silent_chunks al final del seed).
+    """
+    has_spoken = False
+    silent_chunks = 0
+    if not seed_audio:
+        return has_spoken, silent_chunks
+
+    vad_model.reset_states()
+    for data in _iter_vad_chunks(seed_audio):
+        audio_int16 = np.frombuffer(data, dtype=np.int16)
+        audio_float32 = audio_int16.astype(np.float32) / 32768.0
+        speech_prob = float(vad_model(torch.from_numpy(audio_float32), RATE).item())
+        if speech_prob > 0.5:
+            if not has_spoken:
+                has_spoken = True
+                frames.extend(pre_roll)
+                pre_roll.clear()
+            frames.append(data)
+            silent_chunks = 0
+        else:
+            if has_spoken:
+                frames.append(data)
+                silent_chunks += 1
+            else:
+                pre_roll.append(data)
+    return has_spoken, silent_chunks
 
 
 # --- REPRODUCCIÓN Y SÍNTESIS DE AUDIO ---
@@ -704,11 +837,15 @@ def record_user_audio_vad(
     stream,
     prompt: str = "",
     max_wait_for_speech_sec: Optional[float] = None,
+    seed_audio: bytes = b"",
 ) -> bytes:
     """Graba audio dinámicamente cortando al detectar silencio post-habla.
 
     Descarta el silencio inicial y guarda un pre-roll corto para no cortar
     el inicio de la primera palabra.
+
+    Si seed_audio está presente, se trata como audio ya capturado (p.ej. ring
+    buffer de la wake word) y se continúa hasta silencio.
 
     Si max_wait_for_speech_sec está definido y no hay voz en ese tiempo,
     devuelve bytes vacíos (útil para cerrar sesión conversacional).
@@ -730,6 +867,16 @@ def record_user_audio_vad(
         if max_wait_for_speech_sec is not None and max_wait_for_speech_sec > 0
         else None
     )
+
+    if seed_audio:
+        has_spoken, silent_chunks = _apply_seed_audio_to_recording(
+            seed_audio, frames, pre_roll
+        )
+        if has_spoken:
+            print("  [VAD]: Voz detectada (pre-roll wake)...")
+            if silent_chunks >= max_silent_chunks:
+                print("  [VAD]: Fin de intervención por silencio (en seed).")
+                return b"".join(frames)
 
     total_chunks = 0
     vad_model.reset_states()
@@ -1090,16 +1237,25 @@ def _prepare_listen(mic_stream) -> None:
 def run_conversation_session(
     mic_stream,
     conversation_history: List[Dict[str, Any]],
+    initial_audio: Optional[bytes] = None,
+    strip_wake_on_first_turn: bool = False,
 ) -> None:
-    """Tras la wake word: varios turnos seguidos hasta cierre o silencio."""
+    """Tras la wake word: varios turnos seguidos hasta cierre o silencio.
+
+    initial_audio: primer turno ya capturado (comando pegado a la wake word).
+    strip_wake_on_first_turn: quitar 'Hey Kimmi' del transcript del 1er turno.
+    """
     first_turn = True
-    pending_audio: Optional[bytes] = None
+    pending_audio: Optional[bytes] = initial_audio
 
     while True:
         wait_sec = None if first_turn else CONVERSATION_FOLLOWUP_TIMEOUT_SEC
 
         if pending_audio is not None:
-            print("\n=== Usando audio del barge-in ===")
+            if first_turn:
+                print("\n=== Usando audio post-wake (comando pegado) ===")
+            else:
+                print("\n=== Usando audio del barge-in ===")
             user_audio_bytes = pending_audio
             pending_audio = None
         else:
@@ -1120,10 +1276,29 @@ def run_conversation_session(
             break
 
         user_text, stt_ok = transcribe_audio(user_audio_bytes)
+        if first_turn and stt_ok:
+            stripped = strip_wake_phrase(user_text)
+            if stripped != user_text:
+                print(f"  [Wake]: transcript limpio {user_text!r} → {stripped!r}")
+            user_text = stripped
+            if strip_wake_on_first_turn and not user_text.strip():
+                # Solo wake word en el audio sembrado → acuse y escuchar de verdad.
+                print("  [Wake]: solo wake phrase tras strip → acuse + escucha")
+                speak_wake_ack()
+                strip_wake_on_first_turn = False
+                user_audio_bytes = record_user_audio_vad(mic_stream)
+                if not user_audio_bytes:
+                    speak_text("No te escuché. Cuando quieras, vuelve a llamarme.")
+                    break
+                user_text, stt_ok = transcribe_audio(user_audio_bytes)
+                if stt_ok:
+                    user_text = strip_wake_phrase(user_text)
+
         print(f"[Tú]: {user_text!r} (ok={stt_ok})")
         first_turn = False
+        strip_wake_on_first_turn = False
 
-        if not stt_ok:
+        if not stt_ok or not (user_text or "").strip():
             speak_text("No te escuché bien, ¿puedes repetir?")
             continue
 
@@ -1160,6 +1335,29 @@ def run_conversation_session(
             break
 
 
+def capture_after_wake_word(mic_stream, ring_chunks: deque) -> Tuple[Optional[bytes], bool]:
+    """Tras detectar wake word: ack inteligente + posible captura inmediata.
+
+    Devuelve (initial_audio | None, strip_wake_on_first_turn).
+    """
+    seed = b"".join(ring_chunks)
+    continues, peeked = speech_continues_after_wake(seed, mic_stream)
+    seed_with_peek = seed + peeked
+
+    if continues:
+        print("[Wake]: comando pegado → sin acuse")
+        first_audio = record_user_audio_vad(
+            mic_stream,
+            seed_audio=seed_with_peek,
+        )
+        if first_audio:
+            return first_audio, True
+        print("  [Wake]: captura vacía tras comando pegado → acuse")
+
+    speak_wake_ack()
+    return None, False
+
+
 def main():
     mic_stream = audio.open(
         format=FORMAT,
@@ -1170,6 +1368,8 @@ def main():
     )
 
     conversation_history: List[Dict[str, Any]] = []
+    ring_maxlen = max(1, int(WAKE_RING_BUFFER_SEC * RATE / OWW_CHUNK))
+    wake_ring: deque = deque(maxlen=ring_maxlen)
 
     print("\n=== KIMMI EN ESPERA ===")
     print(
@@ -1183,6 +1383,7 @@ def main():
     try:
         while True:
             data = mic_stream.read(OWW_CHUNK, exception_on_overflow=False)
+            wake_ring.append(bytes(data))
             audio_data = np.frombuffer(data, dtype=np.int16)
 
             # Durante/tras TTS no evaluamos wake word (evita falsos positivos por eco).
@@ -1194,14 +1395,23 @@ def main():
 
             if any(score >= WAKE_WORD_THRESHOLD for score in scores):
                 print("\n[Wake Word Detectado!]")
-                speak_wake_ack()
+                initial_audio, strip_wake = capture_after_wake_word(
+                    mic_stream, wake_ring
+                )
+                wake_ring.clear()
 
-                run_conversation_session(mic_stream, conversation_history)
+                run_conversation_session(
+                    mic_stream,
+                    conversation_history,
+                    initial_audio=initial_audio,
+                    strip_wake_on_first_turn=strip_wake,
+                )
 
                 # Anti-eco antes de volver a escuchar wake word.
                 flush_mic_stream(mic_stream)
                 reset_wake_word_model()
                 suppress_wake_word(WAKE_COOLDOWN_SEC)
+                wake_ring.clear()
                 print("\n=== Volviendo a estado de espera ===")
 
     except KeyboardInterrupt:
