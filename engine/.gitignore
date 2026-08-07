@@ -3,6 +3,8 @@ __pycache__/
 tools/__pycache__/
 .jarvis_cache/
 temp_sentence.wav
+memory/*
+!memory/.gitkeep
 
 # TTS
 kokoro/

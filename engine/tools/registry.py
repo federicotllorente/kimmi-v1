@@ -15,6 +15,7 @@ from tools.list_files import list_directory
 from tools.manage_clipboard import manage_clipboard
 from tools.manage_docker_container import manage_docker_container
 from tools.read_files import read_directory_files
+from tools.remember_fact import remember_fact
 from tools.scaffold_project import TEMPLATES, scaffold_project
 from tools.search_codebase import search_codebase
 from tools.write_file import write_file
@@ -123,6 +124,9 @@ def build_tools(
 
     def _repl(code: str, reset_session: bool = False) -> str:
         return exec_python_repl(code, reset_session=reset_session)
+
+    def _remember(fact: str, category: str = "general") -> str:
+        return remember_fact(fact, category=category)
 
     schema: List[dict] = [
         {
@@ -373,6 +377,38 @@ def build_tools(
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "remember_fact",
+                "description": (
+                    "Guarda un dato personal, preferencia, IP de dispositivo, pinout o nota "
+                    "técnica importante en la memoria permanente. "
+                    "Úsala cuando el usuario diga explícitamente que recuerdes algo "
+                    "(recuerda que..., anota que..., guarda en memoria...). "
+                    "NO la uses para charla normal ni para inventar hechos."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "fact": {
+                            "type": "string",
+                            "description": (
+                                "La información clara y concreta a recordar "
+                                '(ej: "La IP de la Raspberry Pi es 192.168.1.50").'
+                            ),
+                        },
+                        "category": {
+                            "type": "string",
+                            "description": (
+                                "Categoría opcional: general, network, hardware, preference, project."
+                            ),
+                        },
+                    },
+                    "required": ["fact"],
+                },
+            },
+        },
     ]
 
     handlers: Dict[str, Callable[..., str]] = {
@@ -388,6 +424,7 @@ def build_tools(
         "search_codebase": _search,
         "manage_docker_container": _docker,
         "fetch_web_docs": _docs,
+        "remember_fact": _remember,
     }
 
     return schema, handlers
@@ -406,22 +443,38 @@ def tools_for_intent(intent: str, tools_schema: List[dict]) -> List[dict]:
     return filtered
 
 
-def build_system_prompt(allowed_root: str) -> str:
+def build_system_prompt(allowed_root: str, memory_context: str = "") -> str:
     apps = ", ".join(list_allowed_app_ids())
+    memory_block = ""
+    if memory_context and memory_context.strip():
+        memory_block = (
+            "\n\nRecuerdos relevantes recuperados de tu memoria permanente "
+            "(úsalos solo si ayudan a responder; no inventes otros):\n"
+            f"{memory_context.strip()}\n"
+        )
+
     return (
         "Eres Jarvis, un asistente local de voz: conciso, directo y útil. "
         "Responde siempre en español con 1 o 2 oraciones conversacionales. "
         "Sin markdown, asteriscos, guiones de lista ni numerales: tu respuesta se lee en voz alta. "
-        "CIERRE: si el usuario agradece, dice que está listo, perfecto, vale, adiós o similar, "
-        "responde con un cierre breve (de nada, cuando quieras) y NO preguntes si necesita algo más. "
-        "Nunca termines con preguntas del tipo necesitas algo más o en qué más te ayudo. "
+        "CIERRE: si el usuario agradece, dice que está bien/listo, que no necesita nada más, "
+        "adiós o similar: responde SOLO con un cierre breve (de nada, cuando quieras). "
+        "PROHIBIDO en ese caso: preguntar si necesita algo más, proponer planes, viajes, "
+        "tareas nuevas o cualquier otra pregunta. "
+        "Nunca termines con signos de interrogación tras un cierre o agradecimiento. "
+        "MEMORIA: tienes memoria permanente con remember_fact. "
+        "Si el usuario pide explícitamente recordar o anotar un dato, usa remember_fact. "
+        "Si menciona un dato personal o técnico importante (IP, pinout, preferencia, contraseña de lab, etc.) "
+        "sin pedir guardarlo, pregunta primero si quiere que lo recuerdes; no llames a la tool hasta que diga que sí. "
+        "Si pregunta por algo que podría estar en memoria, apoyate en los recuerdos inyectados abajo. "
         "DISCIPLINA DE HERRAMIENTAS: "
         "Solo llama a una tool si el usuario pide una acción concreta "
-        "(abrir, listar, escribir, buscar en código, Docker, portapapeles, cálculo, docs). "
+        "(abrir, listar, escribir, buscar en código, Docker, portapapeles, cálculo, docs, recordar). "
         "Saludos, charla, opiniones o preguntas generales: responde SIN tools. "
         "Si hay duda entre tools o faltan datos: pregunta, no ejecutes. "
         "Prefiere cero tools a una incorrecta. Nunca inventes resultados de tools. "
         f"Archivos solo dentro de {allowed_root}. "
         f"Apps allowlisted: {apps}. "
         "Usa como máximo una tool por turno."
+        f"{memory_block}"
     )

@@ -4,13 +4,21 @@ Jarvis es un asistente de IA por voz que corre **en tu máquina**. Escucha una w
 
 Todo está pensado para respuestas cortas y habladas (TTS), en español. Las acciones con efecto lateral piden **confirmación** por voz (estilo Siri).
 
+## Instalación de dependencias
+
+Instala primero los builds CUDA de PyTorch (no vienen de PyPI): `python -m pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121`
+
+Nota: Si no tienes GPU NVIDIA, instala la versión para CPU desde PyPI directamente (o adapta el comando según tu GPU): `python -m pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1`
+
+Después: `python -m pip install -r requirements.txt`
+
 ---
 
 ## Qué incluye
 
 | Pieza | Rol |
 |-------|-----|
-| **openWakeWord** | Detecta la wake word (`hey_jarvis`) |
+| **openWakeWord** | Detecta la wake word (`hey_kee_me`) |
 | **Silero VAD** | Detecta cuándo dejas de hablar |
 | **faster-whisper** (`medium`) | Speech-to-text (más preciso; GPU recomendada) |
 | **Ollama** (`qwen2.5:3b` + `qwen2.5:14b`) | Intent/chat rápido; 14B solo para tools |
@@ -129,15 +137,23 @@ El router vive en [`tools/intent.py`](tools/intent.py). Las tools se registran e
 - Docker: sin `exec` / `rm` / `run` arbitrario; compose sin `down -v`
 - Docs web: solo hosts allowlisted
 - REPL Python: imports restringidos, timeout, sin disco ni red
-- Confirmación obligatoria en launch/write/cursor/scaffold y Docker/clipboard con efecto
+- Confirmación obligatoria en launch/write/cursor/scaffold/remember_fact y Docker/clipboard con efecto
 
 Cachés locales (embeddings, docs) van a `.jarvis_cache/` (ignorado por git).
+La memoria permanente (ChromaDB) vive en `memory/` (también ignorada, salvo `.gitkeep`).
 
 ---
 
 ## Qué puedes pedirle (guía de uso)
 
 Habla en lenguaje natural. Jarvis clasifica la intención y elige la tool; no hace falta decir el nombre exacto, pero estos ejemplos ayudan.
+
+### Memoria permanente (RAG)
+
+- *“Recuerda que la IP de la Raspberry Pi es 192.168.1.50”* → `remember_fact` (pide confirmación)
+- Si mencionas un dato importante sin pedirlo, Jarvis puede preguntarte *“¿Quieres que lo recuerde?”*; si dices que sí, lo guarda
+- *“¿Cuál es la IP de la Pi?”* → recupera contexto por similitud (RAG) antes de responder, sin tool
+- Requiere `ollama pull nomic-embed-text` y el paquete `chromadb`
 
 ### Archivos y código
 
@@ -207,8 +223,11 @@ tools/
   search_codebase.py
   manage_docker_container.py
   fetch_web_docs.py
+  remember_fact.py    # Guardar hechos en memoria
+  memory.py           # ChromaDB + embeddings Ollama (RAG)
   cursor_agent.py
   …                   # Lectura/escritura/listado de archivos
+memory/               # Persistencia ChromaDB (gitignored)
 kokoro/               # Modelos TTS
 ```
 

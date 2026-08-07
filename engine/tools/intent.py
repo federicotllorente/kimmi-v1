@@ -19,6 +19,7 @@ INTENT_TOOL_MAP: Dict[str, List[str]] = {
     "clipboard": ["manage_clipboard"],
     "calc": ["exec_python_repl"],
     "docs": ["fetch_web_docs"],
+    "memory": ["remember_fact"],
 }
 
 VALID_INTENTS: Set[str] = set(INTENT_TOOL_MAP.keys())
@@ -42,6 +43,7 @@ ALWAYS_CONFIRM_TOOLS = frozenset({
     "write_file",
     "run_cursor_agent",
     "scaffold_project",
+    "remember_fact",
 })
 
 _YES_RE = re.compile(
@@ -53,13 +55,24 @@ _NO_RE = re.compile(
     re.IGNORECASE,
 )
 
+_MEMORY_OFFER_RE = re.compile(
+    r"(?i)("
+    r"quieres?\s+que\s+(?:lo\s+)?recuerde|"
+    r"lo\s+guardo\s+en\s+(?:la\s+)?memoria|"
+    r"guardo\s+(?:ese|este)\s+dato|"
+    r"anoto\s+(?:eso|ese\s+dato)|"
+    r"recuerde\s+(?:eso|ese\s+dato|que)"
+    r")"
+)
+
 _CLASSIFY_SYSTEM = (
     "Eres un clasificador de intención para un asistente de voz llamado Jarvis. "
     "Responde SOLO con un JSON válido, sin markdown ni texto extra. "
     "Schema: {\"intent\": string, \"confidence\": number, \"brief_reason\": string}. "
-    "intent debe ser exactamente uno de: chat, apps, files, code, docker, clipboard, calc, docs, clarify. "
+    "intent debe ser exactamente uno de: chat, apps, files, code, docker, clipboard, calc, docs, memory, clarify. "
     "Reglas: "
-    "chat = saludo, charla, pregunta general sin acción en el PC; "
+    "chat = saludo, charla, pregunta general sin acción en el PC "
+    "(incluye preguntar por un dato que ya debería estar en memoria, sin pedir guardarlo); "
     "apps = abrir o enfocar una aplicación; "
     "files = listar, leer o escribir archivos/carpetas; "
     "code = buscar en código, scaffold o agente Cursor; "
@@ -67,6 +80,8 @@ _CLASSIFY_SYSTEM = (
     "clipboard = portapapeles; "
     "calc = cálculos o conversiones numéricas; "
     "docs = documentación web; "
+    "memory = el usuario pide EXPLÍCITAMENTE recordar, anotar o guardar un dato en memoria "
+    "(recuerda que..., anota..., guarda que...); "
     "clarify = audio ambiguo, incompleto o no se entiende. "
     "confidence entre 0 y 1. Si dudas, usa clarify con confidence baja."
 )
@@ -187,6 +202,10 @@ def confirmation_prompt(fn_name: str, fn_args: Optional[Dict[str, Any]] = None) 
     if fn_name == "scaffold_project":
         name = args.get("name", "el proyecto")
         return f"Voy a crear el scaffold {name}. ¿Confirmas?"
+    if fn_name == "remember_fact":
+        fact = str(args.get("fact", "ese dato")).strip()
+        short = fact if len(fact) <= 90 else fact[:87] + "..."
+        return f"Voy a recordar: {short}. ¿Confirmas?"
     if fn_name == "manage_docker_container":
         action = args.get("action", "esa acción")
         return f"Voy a ejecutar Docker {action}. ¿Confirmas?"
@@ -211,3 +230,41 @@ def parse_yes_no(transcript: str) -> Optional[bool]:
         # "sí no" raro → indeterminado
         return None
     return None
+
+
+def last_assistant_offered_memory(history: Optional[List[Dict[str, Any]]]) -> bool:
+    """True si el último mensaje del asistente ofreció guardar algo en memoria."""
+    if not history:
+        return False
+    for msg in reversed(history):
+        if msg.get("role") != "assistant":
+            continue
+        content = str(msg.get("content") or "")
+        return bool(_MEMORY_OFFER_RE.search(content))
+    return False
+
+
+def previous_user_fact(history: Optional[List[Dict[str, Any]]]) -> str:
+    """Último texto del usuario antes del offer (candidato a recuerdo)."""
+    if not history:
+        return ""
+    # history: ... user(fact), assistant(offer)  OR includes older turns
+    saw_assistant = False
+    for msg in reversed(history):
+        role = msg.get("role")
+        if role == "assistant" and not saw_assistant:
+            saw_assistant = True
+            continue
+        if saw_assistant and role == "user":
+            return str(msg.get("content") or "").strip()
+    return ""
+
+
+def should_force_memory_save(
+    user_text: str,
+    history: Optional[List[Dict[str, Any]]],
+) -> bool:
+    """Usuario confirma tras una oferta de recordar → forzar intent memory."""
+    if not last_assistant_offered_memory(history):
+        return False
+    return parse_yes_no(user_text) is True
