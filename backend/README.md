@@ -1,4 +1,4 @@
-# Jarvis Bridge (FastAPI)
+# Kimmi Bridge (FastAPI)
 
 > **Deprecated.** This web bridge was a prototype. The active UI is the desktop HUD in [`../desktop/`](../desktop/). Keep this folder only as reference.
 

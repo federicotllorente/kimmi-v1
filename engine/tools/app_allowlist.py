@@ -62,8 +62,8 @@ APP_CATALOG: Dict[str, AppEntry] = {
 }
 
 
-# Aliases de workspace: clave corta → ruta. Env JARVIS_WORKSPACE_<ALIAS> tiene prioridad.
-# Ejemplo: JARVIS_WORKSPACE_ASSISTANT=C:\Users\...\ai-assistant-test
+# Aliases de workspace: clave corta → ruta. Env KIMMI_WORKSPACE_<ALIAS> tiene prioridad.
+# Ejemplo: KIMMI_WORKSPACE_ASSISTANT=C:\Users\...\ai-assistant-test
 WORKSPACE_ALIASES: Dict[str, str] = {
     "assistant": os.path.realpath("."),
 }
@@ -84,7 +84,7 @@ def resolve_workspace_alias(name: str) -> Optional[str]:
     if not name:
         return None
     key = name.strip().lower()
-    env_key = "JARVIS_WORKSPACE_" + re.sub(r"[^A-Za-z0-9]+", "_", key).upper()
+    env_key = "KIMMI_WORKSPACE_" + re.sub(r"[^A-Za-z0-9]+", "_", key).upper()
     env_val = os.environ.get(env_key, "").strip()
     if env_val:
         return os.path.abspath(os.path.expanduser(env_val))
@@ -101,7 +101,7 @@ def browser_profile_args(profile: str) -> List[str]:
         return []
     if profile == "work":
         directory = (
-            os.environ.get("JARVIS_BROWSER_PROFILE_WORK", "").strip()
+            os.environ.get("KIMMI_BROWSER_PROFILE_WORK", "").strip()
             or "Profile 1"
         )
         return [f"--profile-directory={directory}"]
@@ -123,7 +123,7 @@ def resolve_launch_command(app_id: str) -> Optional[List[str]]:
     system = platform.system()
 
     if app_id == "vscode":
-        custom = _env_path("JARVIS_VSCODE_PATH")
+        custom = _env_path("KIMMI_VSCODE_PATH")
         if custom:
             return [custom]
         which = shutil.which("code")
@@ -140,7 +140,7 @@ def resolve_launch_command(app_id: str) -> Optional[List[str]]:
         return None
 
     if app_id == "cursor":
-        custom = _env_path("JARVIS_CURSOR_PATH")
+        custom = _env_path("KIMMI_CURSOR_PATH")
         if custom:
             return [custom]
         which = shutil.which("cursor")
@@ -157,7 +157,7 @@ def resolve_launch_command(app_id: str) -> Optional[List[str]]:
         return None
 
     if app_id == "browser":
-        custom = _env_path("JARVIS_BROWSER_PATH")
+        custom = _env_path("KIMMI_BROWSER_PATH")
         if custom:
             return [custom]
         if system == "Windows":
@@ -183,7 +183,7 @@ def resolve_launch_command(app_id: str) -> Optional[List[str]]:
         return None
 
     if app_id == "terminal":
-        custom = _env_path("JARVIS_TERMINAL_PATH")
+        custom = _env_path("KIMMI_TERMINAL_PATH")
         if custom:
             return [custom]
         if system == "Windows":

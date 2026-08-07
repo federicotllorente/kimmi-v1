@@ -1,6 +1,6 @@
-# Jarvis — asistente de voz local
+# Kimmi — asistente de voz local
 
-Jarvis es un asistente de IA por voz que corre **en tu máquina**. Escucha una wake word, transcribe lo que dices, clasifica la **intención**, razona con un LLM local (Ollama) y solo entonces puede usar **herramientas** acotadas: abrir apps, buscar en el código, mirar logs de Docker, etc.
+Kimmi es un asistente de IA por voz que corre **en tu máquina**. Escucha una wake word, transcribe lo que dices, clasifica la **intención**, razona con un LLM local (Ollama) y solo entonces puede usar **herramientas** acotadas: abrir apps, buscar en el código, mirar logs de Docker, etc.
 
 Todo está pensado para respuestas cortas y habladas (TTS), en español. Las acciones con efecto lateral piden **confirmación** por voz (estilo Siri).
 
@@ -58,7 +58,7 @@ Modelos de voz Kokoro esperados en:
 
 ---
 
-## Cómo ejecutar Jarvis
+## Cómo ejecutar Kimmi
 
 Desde la raíz del proyecto:
 
@@ -73,11 +73,11 @@ python assistant.py
 Verás mensajes de carga (wake word, VAD, Whisper). Cuando termine:
 
 ```text
-=== JARVIS EN ESPERA (intent router + tools + streaming) ===
+=== KIMMI EN ESPERA (intent router + tools + streaming) ===
 ```
 
-1. Di **“hey Jarvis”** (o la frase del modelo `hey_jarvis`).
-2. Jarvis responde al momento **“Sí, Fede?”** (el nombre se configura con `USER_NAME` en `assistant.py`).
+1. Di **“Hey Kimmi”** (o la frase del modelo `hey_kee_me`).
+2. Kimmi responde al momento **“Sí, Fede?”** (el nombre se configura con `USER_NAME` en `assistant.py`).
 3. Formula el pedido; al detectar silencio, transcribe y clasifica intención con el modelo **rápido**.
 4. Charla → modelo rápido. Acciones/tools → modelo **14B**, confirmación si hace falta, y respuesta por voz.
 5. Vuelve al modo espera (historial corto de conversación).
@@ -89,9 +89,9 @@ Para salir: `Ctrl+C`.
 | Variable | Uso |
 |----------|-----|
 | `CURSOR_API_KEY` | Agente Cursor (`run_cursor_agent`) |
-| `JARVIS_VSCODE_PATH` / `JARVIS_CURSOR_PATH` / `JARVIS_BROWSER_PATH` / `JARVIS_TERMINAL_PATH` | Rutas a ejecutables si no están en el PATH |
-| `JARVIS_BROWSER_PROFILE_WORK` | Directorio de perfil del navegador para `profile=work` |
-| `JARVIS_WORKSPACE_ASSISTANT` | Sobrescribe el alias de workspace `assistant` |
+| `KIMMI_VSCODE_PATH` / `KIMMI_CURSOR_PATH` / `KIMMI_BROWSER_PATH` / `KIMMI_TERMINAL_PATH` | Rutas a ejecutables si no están en el PATH |
+| `KIMMI_BROWSER_PROFILE_WORK` | Directorio de perfil del navegador para `profile=work` |
+| `KIMMI_WORKSPACE_ASSISTANT` | Sobrescribe el alias de workspace `assistant` |
 
 En [`assistant.py`](assistant.py) puedes ajustar:
 
@@ -139,19 +139,19 @@ El router vive en [`tools/intent.py`](tools/intent.py). Las tools se registran e
 - REPL Python: imports restringidos, timeout, sin disco ni red
 - Confirmación obligatoria en launch/write/cursor/scaffold/remember_fact y Docker/clipboard con efecto
 
-Cachés locales (embeddings, docs) van a `.jarvis_cache/` (ignorado por git).
+Cachés locales (embeddings, docs) van a `.kimmi_cache/` (ignorado por git).
 La memoria permanente (ChromaDB) vive en `memory/` (también ignorada, salvo `.gitkeep`).
 
 ---
 
 ## Qué puedes pedirle (guía de uso)
 
-Habla en lenguaje natural. Jarvis clasifica la intención y elige la tool; no hace falta decir el nombre exacto, pero estos ejemplos ayudan.
+Habla en lenguaje natural. Kimmi clasifica la intención y elige la tool; no hace falta decir el nombre exacto, pero estos ejemplos ayudan.
 
 ### Memoria permanente (RAG)
 
 - *“Recuerda que la IP de la Raspberry Pi es 192.168.1.50”* → `remember_fact` (pide confirmación)
-- Si mencionas un dato importante sin pedirlo, Jarvis puede preguntarte *“¿Quieres que lo recuerde?”*; si dices que sí, lo guarda
+- Si mencionas un dato importante sin pedirlo, Kimmi puede preguntarte *“¿Quieres que lo recuerde?”*; si dices que sí, lo guarda
 - *“¿Cuál es la IP de la Pi?”* → recupera contexto por similitud (RAG) antes de responder, sin tool
 - Requiere `ollama pull nomic-embed-text` y el paquete `chromadb`
 
@@ -237,10 +237,10 @@ kokoro/               # Modelos TTS
 
 1. **Frases claras y una intención por turno** — el VAD corta al silencio; evita monólogos largos.
 2. **Nombres concretos** — contenedores Docker, carpetas y apps (“Cursor”, no “el editor”) mejoran el function calling.
-3. **Sandbox** — si pides algo fuera de `ALLOWED_DATA_ROOT`, Jarvis te dirá que no puede.
+3. **Sandbox** — si pides algo fuera de `ALLOWED_DATA_ROOT`, Kimmi te dirá que no puede.
 4. **GPU** — Whisper usa `medium` + CUDA/`float16` en `assistant.py` (más preciso que `small`). Si te falta VRAM, baja `WHISPER_MODEL_SIZE` a `small` o usa CPU/`int8`.
 5. **Voz** — las respuestas evitan markdown a propósito, para que el TTS suene natural.
-6. **Confirmación** — responde “sí” / “dale” o “no” / “cancelar” cuando Jarvis pregunte antes de actuar.
+6. **Confirmación** — responde “sí” / “dale” o “no” / “cancelar” cuando Kimmi pregunte antes de actuar.
 7. **Micrófono** — habla tras el acuse, frases claras y sin ruido de fondo; el STT mejora mucho con buena entrada de audio.
 
 ---

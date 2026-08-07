@@ -30,7 +30,7 @@ from tools.intent import (
     tool_needs_confirmation,
 )
 from tools.registry import build_system_prompt, build_tools, tools_for_intent
-from tools.memory import JarvisMemory
+from tools.memory import KimmiMemory
 
 # --- CONFIGURACIÓN DE PARÁMETROS ---
 FORMAT = pyaudio.paInt16
@@ -82,7 +82,7 @@ KOKORO_FADE_IN_MS = 50
 # Calentar el dispositivo con silencio antes de la primera frase del turno.
 TTS_DEVICE_WARMUP_MS = 80
 
-# Barge-in: escuchar al usuario mientras Jarvis habla.
+# Barge-in: escuchar al usuario mientras Kimmi habla.
 # Si interrumpe: corta el TTS con fade-out corto y captura su frase.
 BARGE_IN_ENABLED = True
 BARGE_IN_GRACE_MS = 400  # no detectar al inicio (eco / arranque del altavoz)
@@ -178,7 +178,7 @@ WHISPER_MODEL_SIZE = "medium"
 WHISPER_BEAM_SIZE = 5
 
 STT_INITIAL_PROMPT = (
-    "El usuario habla en español claro con Jarvis. "
+    "El usuario habla en español claro con Kimmi. "
     f"Se llama {USER_NAME}. "
     "Ejemplos: abre el navegador, abre Cursor, abre VS Code, abre la terminal, "
     "lista los archivos, lee la carpeta tools, escribe un archivo, "
@@ -242,7 +242,7 @@ audio = pyaudio.PyAudio()
 _wake_ignore_until = 0.0
 
 # Memoria
-memory_db = JarvisMemory()
+memory_db = KimmiMemory()
 
 def suppress_wake_word(seconds: float = WAKE_COOLDOWN_SEC) -> None:
     """Bloquea detección de wake word durante N segundos."""
@@ -611,7 +611,7 @@ def speak_text(text: str, allow_barge_in: bool = True) -> bool:
     _tts_skip_remaining.clear()
     _store_barge_in_audio(b"")  # limpia captura previa
 
-    print(f"[Jarvis]: {text}")
+    print(f"[Kimmi]: {text}")
     sentence_queue: queue.Queue = queue.Queue()
     tts_thread = threading.Thread(
         target=tts_worker,
@@ -636,7 +636,7 @@ def speak_wake_ack():
     """Acuse inmediato tras la wake word; frase aleatoria."""
     template = random.choice(WAKE_ACK_PHRASES)
     ack = template.format(name=USER_NAME)
-    print(f"[Jarvis]: {ack}")
+    print(f"[Kimmi]: {ack}")
     # Sin barge-in en el acuse corto (muy breve y fácil de confundir con eco).
     play_tts_sentence(ack, allow_barge_in=False)
 
@@ -714,7 +714,7 @@ def record_user_audio_vad(
     devuelve bytes vacíos (útil para cerrar sesión conversacional).
     """
     if prompt:
-        print(f"\n[Jarvis]: {prompt}")
+        print(f"\n[Kimmi]: {prompt}")
     frames: List[bytes] = []
     has_spoken = False
     silent_chunks = 0
@@ -842,7 +842,7 @@ def stream_ollama_to_tts(
 
     stream = ollama.chat(**kwargs)
 
-    print("[Jarvis]: ", end="", flush=True)
+    print("[Kimmi]: ", end="", flush=True)
     text_buffer = ""
     full_text = ""
     sentence_regex = re.compile(r"([^.!?\n]+[.!?\n]+)")
@@ -971,7 +971,7 @@ def _run_tools_turn(
         if not _confirm_action(mic_stream, fn_name, fn_args):
             return "Cancelado."
 
-    print(f"\n[Jarvis ejecutando {fn_name}...]")
+    print(f"\n[Kimmi ejecutando {fn_name}...]")
     try:
         tool_result = available_tools[fn_name](**fn_args)
     except TypeError as exc:
@@ -1171,7 +1171,7 @@ def main():
 
     conversation_history: List[Dict[str, Any]] = []
 
-    print("\n=== JARVIS EN ESPERA ===")
+    print("\n=== KIMMI EN ESPERA ===")
     print(
         f"Rápido: {FAST_MODEL} | Pesado: {LLM_MODEL} | Usuario: {USER_NAME}"
     )
@@ -1205,7 +1205,7 @@ def main():
                 print("\n=== Volviendo a estado de espera ===")
 
     except KeyboardInterrupt:
-        print("\nCerrando Jarvis...")
+        print("\nCerrando Kimmi...")
     finally:
         mic_stream.stop_stream()
         mic_stream.close()

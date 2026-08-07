@@ -37,7 +37,7 @@ _ERROR_MARKERS = (
 )
 
 _VOWELS = set("aeiouáéíóúüAEIOUÁÉÍÓÚÜ")
-_SPEECH_MARKERS = ("[Jarvis]:", "[Confirmación]:")
+_SPEECH_MARKERS = ("[Kimmi]:", "[Confirmación]:")
 
 
 def parse_engine_line(line: str) -> Optional[tuple[PipelineState, str]]:
@@ -49,7 +49,7 @@ def parse_engine_line(line: str) -> Optional[tuple[PipelineState, str]]:
     if any(marker in text for marker in _ERROR_MARKERS):
         return "error", text
 
-    if "JARVIS EN ESPERA" in text or "Volviendo a estado de espera" in text:
+    if "KIMMI EN ESPERA" in text or "Volviendo a estado de espera" in text:
         return "idle", text
 
     if (
@@ -75,10 +75,10 @@ def parse_engine_line(line: str) -> Optional[tuple[PipelineState, str]]:
     ):
         return "processing", text
 
-    if "[Jarvis]:" in text or "[Confirmación]:" in text:
+    if "[Kimmi]:" in text or "[Confirmación]:" in text:
         return "responding", text
 
-    if "Jarvis ejecutando" in text:
+    if "Kimmi ejecutando" in text:
         return "processing", text
 
     return None
@@ -258,7 +258,7 @@ class EngineBridge(QObject):
 
         # Stay in starting until the engine prints ready (ignore other chatter while loading).
         if not self._ready:
-            if state == "idle" and "JARVIS EN ESPERA" in (message or ""):
+            if state == "idle" and "KIMMI EN ESPERA" in (message or ""):
                 self._ready = True
                 state = "idle"
             elif state == "error":

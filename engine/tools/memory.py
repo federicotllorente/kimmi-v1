@@ -1,4 +1,4 @@
-"""Memoria vectorial persistente de Jarvis (ChromaDB + embeddings Ollama).
+"""Memoria vectorial persistente de Kimmi (ChromaDB + embeddings Ollama).
 
 Guarda hechos en engine/memory/ y recupera los más relevantes por similitud.
 Requiere: chromadb, ollama, y el modelo nomic-embed-text (`ollama pull nomic-embed-text`).
@@ -22,7 +22,7 @@ MAX_FACT_CHARS = 800
 MAX_CONTEXT_CHARS = 1200
 
 
-class JarvisMemory:
+class KimmiMemory:
     def __init__(
         self,
         db_path: str = DEFAULT_DB_PATH,
@@ -33,7 +33,7 @@ class JarvisMemory:
         self.embed_model = embed_model
         self.client = chromadb.PersistentClient(path=db_path)
         self.collection = self.client.get_or_create_collection(
-            name="jarvis_knowledge",
+            name="kimmi_knowledge",
             metadata={"hnsw:space": "cosine"},
         )
 
@@ -155,4 +155,4 @@ class JarvisMemory:
 
 
 # Instancia compartida por el proceso (tool + RAG del bucle).
-memory_db = JarvisMemory()
+memory_db = KimmiMemory()

@@ -2,7 +2,7 @@
 
 Requiere: ripgrep (`rg`) en PATH para mode=regex (con fallback).
 Para semantic: Ollama + modelo embeddings (ej. nomic-embed-text).
-Caché semántica en {allowed_root}/.jarvis_cache/embeddings.json.
+Caché semántica en {allowed_root}/.kimmi_cache/embeddings.json.
 """
 from __future__ import annotations
 

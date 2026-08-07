@@ -12,10 +12,10 @@ from wave_gl import WaveGLWidget
 WINDOW_SIZE = 200
 
 
-class JarvisWindow(QMainWindow):
+class KimmiWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("JARVIS")
+        self.setWindowTitle("KIMMI")
         self.setFixedSize(WINDOW_SIZE, WINDOW_SIZE)
         self.setWindowFlags(
             self.windowFlags()
@@ -48,9 +48,9 @@ class JarvisWindow(QMainWindow):
 
 def main() -> int:
     app = QApplication(sys.argv)
-    app.setApplicationName("JARVIS")
+    app.setApplicationName("KIMMI")
 
-    window = JarvisWindow()
+    window = KimmiWindow()
     window.start_engine()
     window.show()
     return app.exec()

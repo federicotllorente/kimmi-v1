@@ -24,7 +24,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     await bridge.stop()
 
 
-app = FastAPI(title="Jarvis Bridge", lifespan=lifespan)
+app = FastAPI(title="Kimmi Bridge", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

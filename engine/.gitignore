@@ -1,7 +1,7 @@
 proj-env/
 __pycache__/
 tools/__pycache__/
-.jarvis_cache/
+.kimmi_cache/
 temp_sentence.wav
 memory/*
 !memory/.gitkeep

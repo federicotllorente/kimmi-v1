@@ -1,4 +1,4 @@
-# Jarvis UI (Vite + React)
+# Kimmi UI (Vite + React)
 
 > **Deprecated.** This web UI was a prototype. The active UI is the desktop HUD in [`../desktop/`](../desktop/). Keep this folder only as reference.
 

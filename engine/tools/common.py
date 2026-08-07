@@ -16,7 +16,7 @@ SKIP_DIR_NAMES = frozenset(
         "venv",
         "proj-env",
         ".next",
-        ".jarvis_cache",
+        ".kimmi_cache",
         "dist",
         "build",
         ".tox",
@@ -25,7 +25,7 @@ SKIP_DIR_NAMES = frozenset(
     }
 )
 
-CACHE_DIR_NAME = ".jarvis_cache"
+CACHE_DIR_NAME = ".kimmi_cache"
 
 
 def truncate(text: str, max_chars: int) -> str:
@@ -91,7 +91,7 @@ def iter_safe_text_files(
 
 
 def ensure_cache_dir(allowed_root: str, *subdirs: str) -> str:
-    """Crea y devuelve {allowed_root}/.jarvis_cache[/subdirs]."""
+    """Crea y devuelve {allowed_root}/.kimmi_cache[/subdirs]."""
     path = os.path.join(os.path.realpath(allowed_root), CACHE_DIR_NAME, *subdirs)
     os.makedirs(path, exist_ok=True)
     return path

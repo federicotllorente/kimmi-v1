@@ -1,7 +1,7 @@
 """Descarga y resume documentación oficial de librerías/APIs.
 
 Solo hosts allowlisted. mode: summary (Ollama) | extract (solo texto).
-Caché en {allowed_root}/.jarvis_cache/docs/ (TTL 24h).
+Caché en {allowed_root}/.kimmi_cache/docs/ (TTL 24h).
 Requiere: stdlib + ollama (para summary).
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ MAX_EXTRACT_CHARS = 4000
 MAX_OUTPUT_CHARS = 2000
 FETCH_TIMEOUT_SEC = 15
 CACHE_TTL_SEC = 24 * 60 * 60
-USER_AGENT = "JarvisDocsBot/1.0 (+local-assistant)"
+USER_AGENT = "KimmiDocsBot/1.0 (+local-assistant)"
 
 ALLOWED_HOSTS: Set[str] = {
     "docs.python.org",

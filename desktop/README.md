@@ -1,4 +1,4 @@
-# Jarvis Desktop HUD
+# Kimmi Desktop HUD
 
 Small always-on-top OpenGL window that visualizes the local voice pipeline.
 

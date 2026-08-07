@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { JarvisWave } from './components/JarvisWave'
+import { KimmiWave } from './components/KimmiWave'
 import { STATE_LABELS, type PipelineState, type StatusEvent } from './lib/types'
 import { StatusSocket } from './lib/ws'
 import './App.css'
@@ -26,12 +26,12 @@ export default function App() {
     <div className={`app state-${state}`}>
       <div className="bg-glow" aria-hidden />
       <header className="brand">
-        <h1>JARVIS</h1>
+        <h1>KIMMI</h1>
         <p className="tagline">ASSISTANT INTERFACE</p>
       </header>
 
       <main className="stage">
-        <JarvisWave state={state} amplitude={status.amplitude} />
+        <KimmiWave state={state} amplitude={status.amplitude} />
       </main>
 
       <footer className="hud">

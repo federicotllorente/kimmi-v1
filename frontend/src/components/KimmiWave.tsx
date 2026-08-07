@@ -4,7 +4,7 @@ import { OrbitControls } from '@react-three/drei'
 import * as THREE from 'three'
 import type { PipelineState } from '../lib/types'
 
-type JarvisWaveProps = {
+type KimmiWaveProps = {
   state: PipelineState
   amplitude: number
 }
@@ -29,7 +29,7 @@ function stateMotion(state: PipelineState, t: number, amp: number, i: number): n
   return 0.3 + amp * (0.85 + 0.4 * Math.sin(t * 6 + phase * 1.5))
 }
 
-function RadialBars({ state, amplitude }: JarvisWaveProps) {
+function RadialBars({ state, amplitude }: KimmiWaveProps) {
   const group = useRef<THREE.Group>(null)
   const meshes = useRef<THREE.Mesh[]>([])
   const ampRef = useRef(amplitude)
@@ -99,7 +99,7 @@ function RadialBars({ state, amplitude }: JarvisWaveProps) {
   return <group ref={group}>{bars}</group>
 }
 
-function CoreOrb({ amplitude, state }: JarvisWaveProps) {
+function CoreOrb({ amplitude, state }: KimmiWaveProps) {
   const mesh = useRef<THREE.Mesh>(null)
   const glow = useRef<THREE.Mesh>(null)
 
@@ -140,7 +140,7 @@ function CoreOrb({ amplitude, state }: JarvisWaveProps) {
   )
 }
 
-function Rings({ state, amplitude }: JarvisWaveProps) {
+function Rings({ state, amplitude }: KimmiWaveProps) {
   const outer = useRef<THREE.Mesh>(null)
   const mid = useRef<THREE.Mesh>(null)
 
@@ -172,7 +172,7 @@ function Rings({ state, amplitude }: JarvisWaveProps) {
   )
 }
 
-function Scene({ state, amplitude }: JarvisWaveProps) {
+function Scene({ state, amplitude }: KimmiWaveProps) {
   return (
     <>
       <color attach="background" args={[DEEP]} />
@@ -187,7 +187,7 @@ function Scene({ state, amplitude }: JarvisWaveProps) {
   )
 }
 
-export function JarvisWave({ state, amplitude }: JarvisWaveProps) {
+export function KimmiWave({ state, amplitude }: KimmiWaveProps) {
   return (
     <div className="wave-canvas">
       <Canvas camera={{ position: [0, 1.4, 4.2], fov: 42 }} dpr={[1, 1.75]}>

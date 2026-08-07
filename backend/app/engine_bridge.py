@@ -31,7 +31,7 @@ def parse_engine_line(line: str) -> Optional[tuple[PipelineState, str]]:
     if not text:
         return None
 
-    if "JARVIS EN ESPERA" in text or "Volviendo a estado de espera" in text:
+    if "KIMMI EN ESPERA" in text or "Volviendo a estado de espera" in text:
         return "idle", text
 
     if "[Wake Word Detectado" in text or "[VAD]:" in text:
@@ -43,10 +43,10 @@ def parse_engine_line(line: str) -> Optional[tuple[PipelineState, str]]:
     ):
         return "processing", text
 
-    if "[Jarvis]:" in text or "[Confirmación]:" in text:
+    if "[Kimmi]:" in text or "[Confirmación]:" in text:
         return "responding", text
 
-    if "Jarvis ejecutando" in text:
+    if "Kimmi ejecutando" in text:
         return "processing", text
 
     return None

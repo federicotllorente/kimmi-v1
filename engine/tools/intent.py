@@ -66,7 +66,7 @@ _MEMORY_OFFER_RE = re.compile(
 )
 
 _CLASSIFY_SYSTEM = (
-    "Eres un clasificador de intención para un asistente de voz llamado Jarvis. "
+    "Eres un clasificador de intención para un asistente de voz llamado Kimmi. "
     "Responde SOLO con un JSON válido, sin markdown ni texto extra. "
     "Schema: {\"intent\": string, \"confidence\": number, \"brief_reason\": string}. "
     "intent debe ser exactamente uno de: chat, apps, files, code, docker, clipboard, calc, docs, memory, clarify. "

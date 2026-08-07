@@ -1,7 +1,7 @@
 """Lanza aplicaciones de la allowlist (VS Code, Cursor, navegador, terminal).
 
-Requiere: stdlib. Rutas opcionales vía JARVIS_VSCODE_PATH, JARVIS_CURSOR_PATH,
-JARVIS_BROWSER_PATH, JARVIS_TERMINAL_PATH.
+Requiere: stdlib. Rutas opcionales vía KIMMI_VSCODE_PATH, KIMMI_CURSOR_PATH,
+KIMMI_BROWSER_PATH, KIMMI_TERMINAL_PATH.
 Aliases de workspace y perfiles: ver tools.app_allowlist.
 """
 from __future__ import annotations
