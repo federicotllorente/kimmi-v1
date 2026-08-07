@@ -6,6 +6,7 @@ import re
 import subprocess
 import time
 import wave
+import threading
 from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,6 +25,7 @@ from audio_out import (
     SpeechPipeline,
     linear_resample,
 )
+from clip_cache import ClipCache, make_signature
 from tools.app_allowlist import list_allowed_app_ids
 from tools.intent import (
     INTENT_CONFIDENCE_THRESHOLD,
@@ -102,6 +104,13 @@ KOKORO_VOICES = "kokoro/voices-v1_0.bin"
 # cierra, así que ya no hacen falta ni lead-in ni warmup del dispositivo.
 KOKORO_FADE_IN_MS = 50
 
+# Earcon: tono corto en cuanto el VAD corta la frase, para confirmar "te
+# escuché" a los ~0 ms. No pasa por TTS, así que no tiene idioma ni coste.
+EARCON_ENABLED = False
+EARCON_FREQ_HZ = 880.0
+EARCON_MS = 90
+EARCON_GAIN = 0.12
+
 # Barge-in: escuchar al usuario mientras Kimmi habla.
 # Si interrumpe: corta el TTS con fade-out corto y captura su frase.
 BARGE_IN_ENABLED = True
@@ -141,6 +150,33 @@ CLOSING_ACK_PHRASES = [
     "Listo.",
     "Un placer.",
 ]
+
+# Relleno hablado cuando el turno se va de tiempo. El umbral se mide desde el
+# corte del VAD, no desde el LLM: hoy un turno normal empieza a sonar entre 830
+# y 1100 ms, así que a 1200 ms el relleno solo aparece cuando algo va lento.
+FILLER_ENABLED = True
+FILLER_AFTER_MS = 1200
+FILLER_PHRASES = [
+    "Dame un segundo.",
+    "A ver...",
+    "Déjame ver.",
+    "Un momento.",
+]
+
+# Los turnos con tools llaman al modelo pesado sin stream: ahí ya sabemos que
+# va a tardar, así que el aviso es explícito y no espera al timer.
+FILLER_TOOLS_PHRASE = "Déjame comprobarlo."
+
+# Avisos cortos con texto fijo. Están juntos para que entren al caché de audio
+# por una sola lista, y porque son el inventario que la tanda 3 mueve al Locale.
+SPOKEN = {
+    "not_heard_session_end": "No te escuché. Cuando quieras, vuelve a llamarme.",
+    "not_heard_repeat": "No te escuché bien, ¿puedes repetir?",
+    "not_heard_cancelled": "No te escuché bien. Cancelado.",
+    "cancelled": "Cancelado.",
+    "confirm_unclear": "No entendí la confirmación. Cancelado.",
+    "tool_unavailable": "No puedo usar esa herramienta.",
+}
 
 # Heurística: despedida / agradecimiento → cierre corto, sin LLM.
 # Frases "exactas" (casi todo el utterance).
@@ -278,9 +314,10 @@ tools_schema, available_tools = build_tools(
 print("Cargando modelo Wake Word...")
 oww_model = Model(
     wakeword_models=[
-        "oww/kee_me.onnx",      # "Kimmi"
-        "oww/hey_kee_me.onnx",  # "Hey Kimmi"
-        "oww/okay_kee_me.onnx", # "OK Kimmi"
+        "oww/kee_me.onnx",       # "Kimmi"
+        "oww/hey_kee_me.onnx",   # "Hey Kimmi"
+        "oww/okay_kee_me.onnx",  # "OK Kimmi"
+        "oww/eigh_ghee_me.onnx", # "Ey Kimmi" (suena más natural en español)
     ],
     inference_framework="onnx",
 )
@@ -521,6 +558,31 @@ audio_sink = AudioSink(
     on_first_audio=lambda: perf.mark("ttfa"),
 )
 
+
+def _build_earcon(sample_rate: int) -> np.ndarray:
+    """Sine under a raised-cosine envelope, so it fades in and out clickless."""
+    n = int(sample_rate * (EARCON_MS / 1000.0))
+    if n <= 1:
+        return np.zeros(0, dtype=np.float32)
+    ramp = np.arange(n, dtype=np.float32)
+    tone = np.sin(2.0 * np.pi * EARCON_FREQ_HZ * ramp / sample_rate)
+    envelope = 0.5 - 0.5 * np.cos(2.0 * np.pi * ramp / (n - 1))
+    return (tone * envelope * EARCON_GAIN).astype(np.float32)
+
+
+EARCON = _build_earcon(DEFAULT_SAMPLE_RATE)
+
+
+def play_earcon() -> None:
+    """Acuse instantáneo al cortar el VAD, antes incluso de transcribir.
+
+    notify=False: no es la respuesta, así que no debe contar como ttfa.
+    """
+    if not EARCON_ENABLED or EARCON.size == 0:
+        return
+    audio_sink.enqueue(EARCON, notify=False)
+    perf.mark("earcon")
+
 barge_in_monitor = BargeInMonitor(
     open_stream=_open_barge_in_stream,
     is_user_speech=_mic_chunk_is_user_speech,
@@ -611,6 +673,69 @@ speech = SpeechPipeline(
     fade_out_ms=BARGE_IN_FADE_OUT_MS,
 )
 
+clip_cache = ClipCache(
+    root=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".kimmi_cache", "tts"),
+    synthesize=lambda text: _synthesize_chunk(text, True),
+    signature=make_signature(
+        TTS_ENGINE,
+        KOKORO_VOICE if TTS_ENGINE == "kokoro" else PIPER_MODEL,
+        KOKORO_SPEED,
+        KOKORO_LANG,
+        audio_sink.sample_rate,
+    ),
+)
+
+
+def fixed_phrases() -> List[str]:
+    """Todo lo que Kimmi dice con texto fijo, o sea, lo cacheable."""
+    phrases = [t.format(name=USER_NAME) for t in WAKE_ACK_PHRASES]
+    phrases += CLOSING_ACK_PHRASES
+    phrases += FILLER_PHRASES
+    phrases.append(FILLER_TOOLS_PHRASE)
+    phrases += list(SPOKEN.values())
+    return phrases
+
+
+# Un solo relleno por turno: si el camino de tools ya avisó, el chat no repite.
+_filler_played = threading.Event()
+
+
+def _enqueue_filler(phrase: str) -> bool:
+    """Encola un relleno si de verdad hace falta. No imprime nada.
+
+    Silencio deliberado: desktop/bridge.py ingiere caracteres tras [Kimmi]:
+    hasta el primer salto de línea, y stream_ollama_to_tts ya dejó esa línea
+    abierta. Un print desde aquí congelaría la onda el resto de la respuesta.
+    """
+    if not FILLER_ENABLED or _filler_played.is_set():
+        return False
+    # Si ya suena o hay algo encolado, el relleno caería por detrás de la voz.
+    if audio_sink.has_emitted_audio() or audio_sink.pending_seconds() > 0:
+        return False
+    clip = clip_cache.get(phrase)
+    if clip is None:
+        return False
+    _filler_played.set()
+    audio_sink.enqueue(clip, notify=False)
+    perf.mark("filler")
+    return True
+
+
+def arm_filler() -> Optional[threading.Timer]:
+    """Programa el relleno para que suene solo si el turno tarda de más."""
+    if not FILLER_ENABLED or _filler_played.is_set():
+        return None
+    elapsed = perf.elapsed_ms() or 0
+    delay = max(0.0, (FILLER_AFTER_MS - elapsed) / 1000.0)
+    timer = threading.Timer(
+        delay,
+        _enqueue_filler,
+        args=(random.choice(FILLER_PHRASES),),
+    )
+    timer.daemon = True
+    timer.start()
+    return timer
+
 
 def speak_text(text: str, allow_barge_in: bool = True) -> bool:
     """Reproduce texto por TTS (bloqueante hasta que termina el audio).
@@ -623,7 +748,12 @@ def speak_text(text: str, allow_barge_in: bool = True) -> bool:
 
     print(f"[Kimmi]: {text}")
     speech.begin_turn(allow_barge_in=allow_barge_in and BARGE_IN_ENABLED)
-    speech.feed(text.strip())
+    # Las frases fijas salen del caché: es un memcpy en vez de ~250 ms de Kokoro.
+    clip = clip_cache.get(text)
+    if clip is not None:
+        speech.play_clip(clip, notify=True)
+    else:
+        speech.feed(text.strip())
     barged = speech.end_turn()
     # Tras hablar, el mic capta el eco → no aceptar wake word un momento.
     suppress_wake_word(WAKE_COOLDOWN_SEC)
@@ -905,23 +1035,26 @@ def _confirm_action(stream, fn_name: str, fn_args: dict) -> bool:
     transcript, ok = transcribe_audio(audio_bytes)
     print(f"[Confirmación]: {transcript!r} (ok={ok})")
     if not ok:
-        speak_text("No te escuché bien. Cancelado.")
+        speak_text(SPOKEN["not_heard_cancelled"])
         return False
     decision = parse_yes_no(transcript)
     if decision is True:
         return True
     if decision is False:
-        speak_text("Cancelado.")
+        speak_text(SPOKEN["cancelled"])
         return False
-    speak_text("No entendí la confirmación. Cancelado.")
+    speak_text(SPOKEN["confirm_unclear"])
     return False
 
 
 def _chat_reply(messages: List[Dict[str, Any]], model: str) -> str:
     speech.begin_turn(allow_barge_in=BARGE_IN_ENABLED)
+    filler_timer = arm_filler()
     try:
         final = stream_ollama_to_tts(messages, model=model)
     finally:
+        if filler_timer is not None:
+            filler_timer.cancel()
         speech.end_turn()
         suppress_wake_word(WAKE_COOLDOWN_SEC)
     return final or "Listo."
@@ -934,6 +1067,9 @@ def _run_tools_turn(
 ) -> str:
     """Una llamada con tools (modelo pesado) + confirmación + resumen."""
     print(f"  [LLM]: usando {LLM_MODEL} con tools...")
+    # El 14B va sin stream y solo habla al terminar: aquí ya sabemos que va a
+    # tardar, así que el aviso es inmediato y no espera al timer.
+    _enqueue_filler(FILLER_TOOLS_PHRASE)
     response = ollama.chat(
         model=LLM_MODEL,
         messages=messages,
@@ -964,13 +1100,13 @@ def _run_tools_turn(
             fn_args = {}
 
     if fn_name not in available_tools:
-        final = "No puedo usar esa herramienta."
+        final = SPOKEN["tool_unavailable"]
         speak_text(final)
         return final
 
     if tool_needs_confirmation(fn_name, fn_args):
         if not _confirm_action(mic_stream, fn_name, fn_args):
-            return "Cancelado."
+            return SPOKEN["cancelled"]
 
     print(f"\n[Kimmi ejecutando {fn_name}...]")
     try:
@@ -997,6 +1133,8 @@ def handle_user_turn(
     Pipeline: cierre rápido | (opcional intent) | chat o tools.
     Devuelve el texto final del asistente para el historial.
     """
+    _filler_played.clear()
+
     # Cierre conversacional: no LLM, no "¿necesitas algo más?"
     if is_conversation_closing(user_text):
         print("  [Cierre]: despedida/agradecimiento detectado")
@@ -1127,7 +1265,7 @@ def run_conversation_session(
 
         if not user_audio_bytes:
             if first_turn:
-                speak_text("No te escuché. Cuando quieras, vuelve a llamarme.")
+                speak_text(SPOKEN["not_heard_session_end"])
             else:
                 print("  [Sesión]: silencio → fin de conversación")
             break
@@ -1135,6 +1273,7 @@ def run_conversation_session(
         # El turno arranca cuando el usuario deja de hablar: todo lo que venga
         # después es latencia que él percibe.
         perf.start_turn()
+        play_earcon()
         with perf.span("stt"):
             user_text, stt_ok = transcribe_audio(user_audio_bytes)
         if first_turn and stt_ok:
@@ -1149,9 +1288,10 @@ def run_conversation_session(
                 strip_wake_on_first_turn = False
                 user_audio_bytes = record_user_audio_vad(mic_stream)
                 if not user_audio_bytes:
-                    speak_text("No te escuché. Cuando quieras, vuelve a llamarme.")
+                    speak_text(SPOKEN["not_heard_session_end"])
                     break
                 perf.start_turn()
+                play_earcon()
                 with perf.span("stt"):
                     user_text, stt_ok = transcribe_audio(user_audio_bytes)
                 if stt_ok:
@@ -1162,7 +1302,7 @@ def run_conversation_session(
         strip_wake_on_first_turn = False
 
         if not stt_ok or not (user_text or "").strip():
-            speak_text("No te escuché bien, ¿puedes repetir?")
+            speak_text(SPOKEN["not_heard_repeat"])
             perf.finish_turn()
             continue
 
@@ -1267,6 +1407,17 @@ def warmup() -> None:
             )
         except Exception as exc:  # noqa: BLE001
             print(f"  [Warmup]: Kokoro falló ({exc})")
+
+    # Después de Kokoro: la primera síntesis es la que inicializa espeak.
+    try:
+        started = time.monotonic()
+        reused, synthesized = clip_cache.prime(fixed_phrases())
+        print(
+            f"  [Clips]: {reused + synthesized} en caché "
+            f"({synthesized} sintetizados en {time.monotonic() - started:.1f}s)"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [Clips]: no se pudo preparar el caché ({exc})")
 
     try:
         transcribe_audio(b"\x00\x00" * (RATE // 2))

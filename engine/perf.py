@@ -24,10 +24,12 @@ ENABLED = os.environ.get("KIMMI_PERF", "1").strip().lower() not in _OFF_VALUES
 
 # Render order for the report line; unknown fields are appended after these.
 _FIELD_ORDER = (
+    "earcon",
     "stt",
     "rag",
     "llm_ttft",
     "synth1",
+    "filler",
     "ttfa",
     "spoken",
     "total",
@@ -48,6 +50,10 @@ class TurnTimer:
 
     def _elapsed_ms(self) -> int:
         return int((time.monotonic() - self._t0) * 1000)
+
+    def elapsed_ms(self) -> int:
+        """Milliseconds since the turn started."""
+        return self._elapsed_ms()
 
     def mark(self, field: str, once: bool = True) -> None:
         """Record milliseconds elapsed from turn start until now."""
@@ -127,6 +133,12 @@ def mark(field: str, once: bool = True) -> None:
     timer = current()
     if timer is not None:
         timer.mark(field, once=once)
+
+
+def elapsed_ms() -> Optional[int]:
+    """Milliseconds since the current turn started, or None if there is none."""
+    timer = current()
+    return timer.elapsed_ms() if timer is not None else None
 
 
 def duration(field: str, milliseconds: float) -> None:

@@ -129,6 +129,10 @@ class AudioSink:
 
     The stream callback never blocks: it copies whatever is queued and pads the
     rest of the block with silence.
+
+    Each queued block carries a ``notify`` flag. Only blocks that opt in fire
+    ``on_first_audio``, so non-speech audio (the earcon, a filler clip) does not
+    get counted as the start of the reply.
     """
 
     def __init__(
@@ -141,7 +145,7 @@ class AudioSink:
         self.blocksize = blocksize
         self._on_first_audio = on_first_audio
         self._lock = threading.Lock()
-        self._blocks: Deque[np.ndarray] = deque()
+        self._blocks: Deque[Tuple[np.ndarray, bool]] = deque()
         self._pending_frames = 0
         self._emitted_audio = False
         self._drained = threading.Event()
@@ -187,23 +191,25 @@ class AudioSink:
     def _callback(self, outdata, frames, time_info, status) -> None:  # noqa: ANN001
         try:
             written = 0
+            notified = False
             with self._lock:
                 while written < frames and self._blocks:
-                    block = self._blocks[0]
+                    block, notify = self._blocks[0]
                     take = min(frames - written, block.shape[0])
                     outdata[written : written + take, 0] = block[:take]
                     written += take
                     self._pending_frames -= take
+                    notified = notified or notify
                     if take == block.shape[0]:
                         self._blocks.popleft()
                     else:
-                        self._blocks[0] = block[take:]
+                        self._blocks[0] = (block[take:], notify)
                 if not self._blocks:
                     self._pending_frames = 0
                     self._drained.set()
             if written < frames:
                 outdata[written:, 0] = 0.0
-            if written > 0 and not self._emitted_audio:
+            if notified and not self._emitted_audio:
                 self._emitted_audio = True
                 callback = self._on_first_audio
                 if callback is not None:
@@ -218,12 +224,17 @@ class AudioSink:
         """Re-arm the first-audio notification for a new turn."""
         self._emitted_audio = False
 
-    def enqueue(self, waveform: np.ndarray) -> None:
+    def has_emitted_audio(self) -> bool:
+        """True once a notifying block has actually reached the device."""
+        return self._emitted_audio
+
+    def enqueue(self, waveform: np.ndarray, notify: bool = True) -> None:
+        """Queue audio. ``notify=False`` keeps it out of the first-audio metric."""
         if self._failed or waveform is None or waveform.size == 0:
             return
         block = np.ascontiguousarray(np.asarray(waveform, dtype=np.float32).reshape(-1))
         with self._lock:
-            self._blocks.append(block)
+            self._blocks.append((block, notify))
             self._pending_frames += block.shape[0]
             self._drained.clear()
 
@@ -245,25 +256,28 @@ class AudioSink:
                 self._pending_frames = 0
                 self._drained.set()
                 return
-            head = self._take_frames_locked(fade_frames)
+            head, notify = self._take_frames_locked(fade_frames)
             head *= np.linspace(1.0, 0.0, num=head.shape[0], dtype=np.float32)
             self._blocks.clear()
-            self._blocks.append(head)
+            self._blocks.append((head, notify))
             self._pending_frames = head.shape[0]
 
-    def _take_frames_locked(self, count: int) -> np.ndarray:
+    def _take_frames_locked(self, count: int) -> Tuple[np.ndarray, bool]:
         parts: List[np.ndarray] = []
+        notify = False
         remaining = count
         while remaining > 0 and self._blocks:
-            block = self._blocks[0]
+            block, block_notify = self._blocks[0]
             take = min(remaining, block.shape[0])
             parts.append(block[:take])
+            notify = notify or block_notify
             remaining -= take
             if take == block.shape[0]:
                 self._blocks.popleft()
             else:
-                self._blocks[0] = block[take:]
-        return np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+                self._blocks[0] = (block[take:], block_notify)
+        head = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+        return head, notify
 
     def wait_drain(self, timeout: Optional[float] = None) -> bool:
         """Block until the queue is empty and the device buffer has played out."""
@@ -551,6 +565,19 @@ class SpeechPipeline:
         self._sink.reset_first_audio()
         if allow_barge_in and self._monitor is not None:
             self._monitor.arm(self._on_barge_in)
+
+    def play_clip(self, waveform: Optional[np.ndarray], notify: bool = False) -> bool:
+        """Queue an already-rendered clip. Returns False if the turn was cut.
+
+        Deliberately does not touch ``_chunk_index``: the next synthesized chunk
+        is still the first one, so ``synth1`` stays measurable and it keeps its
+        fade-in, which is the attack of a new phrase rather than a dip mid-word.
+        """
+        if waveform is None or waveform.size == 0 or self._abort.is_set():
+            return False
+        self._spoken_seconds += waveform.size / float(self._sink.sample_rate)
+        self._sink.enqueue(waveform, notify=notify)
+        return True
 
     def feed(self, text: str) -> None:
         """Accumulate text and queue whatever is already speakable."""
