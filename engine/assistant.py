@@ -229,8 +229,9 @@ tools_schema, available_tools = build_tools(
 print("Cargando modelo Wake Word...")
 oww_model = Model(
     wakeword_models=[
-        "oww/hey_kee_me.onnx",  # "Hey Kimmi"
         "oww/kee_me.onnx",      # "Kimmi"
+        "oww/hey_kee_me.onnx",  # "Hey Kimmi"
+        "oww/okay_kee_me.onnx", # "OK Kimmi"
     ],
     inference_framework="onnx",
 )
