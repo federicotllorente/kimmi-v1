@@ -6,8 +6,6 @@ import re
 import subprocess
 import time
 import wave
-import queue
-import threading
 from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -17,8 +15,15 @@ import torch
 import ollama
 from openwakeword.model import Model
 from faster_whisper import WhisperModel
-import sounddevice as sd
 
+import perf
+from audio_out import (
+    DEFAULT_SAMPLE_RATE,
+    AudioSink,
+    BargeInMonitor,
+    SpeechPipeline,
+    linear_resample,
+)
 from tools.app_allowlist import list_allowed_app_ids
 from tools.intent import (
     INTENT_CONFIDENCE_THRESHOLD,
@@ -29,8 +34,8 @@ from tools.intent import (
     should_force_memory_save,
     tool_needs_confirmation,
 )
-from tools.registry import build_system_prompt, build_tools, tools_for_intent
-from tools.memory import KimmiMemory
+from tools.registry import build_system_prompt, build_tools, format_memory_block, tools_for_intent
+from tools.memory import memory_db
 
 # --- CONFIGURACIÓN DE PARÁMETROS ---
 FORMAT = pyaudio.paInt16
@@ -42,7 +47,11 @@ OWW_CHUNK = 1280  # ~80 ms por chunk para openWakeWord
 
 WAKE_WORD_THRESHOLD = 0.5
 # Tras TTS / fin de turno, ignorar wake word (eco del altavoz en el mic).
+# Solo aplica al detector de wake word, no a la escucha dentro de una sesión.
 WAKE_COOLDOWN_SEC = 1.25
+# Pausa corta antes de volver a grabar en una sesión activa (eco residual).
+# El barge-in ya cubre el caso de hablar encima, así que no hace falta más.
+MIC_SETTLE_SEC = 0.25
 # Pre-roll mientras esperamos wake word (comando pegado: "Hey Kimmi, …").
 WAKE_RING_BUFFER_SEC = 2.0
 # Ventana post-wake para decidir si el usuario sigue hablando (sin acuse TTS).
@@ -86,14 +95,12 @@ PIPER_MODEL = "piper/es_MX-claude-high.onnx"
 TTS_ENGINE = "kokoro"
 KOKORO_VOICE = "ef_dora"
 KOKORO_SPEED = 1.2
+KOKORO_LANG = "es"
 KOKORO_MODEL = "kokoro/kokoro-v1_0.onnx"
 KOKORO_VOICES = "kokoro/voices-v1_0.bin"
-# Silencio al inicio/final (ms) para que el altavoz no corte la primera sílaba.
-KOKORO_LEAD_IN_MS = 280
-KOKORO_TRAIL_MS = 80
+# Fade-in solo en el primer chunk del turno. El stream de salida nunca se
+# cierra, así que ya no hacen falta ni lead-in ni warmup del dispositivo.
 KOKORO_FADE_IN_MS = 50
-# Calentar el dispositivo con silencio antes de la primera frase del turno.
-TTS_DEVICE_WARMUP_MS = 80
 
 # Barge-in: escuchar al usuario mientras Kimmi habla.
 # Si interrumpe: corta el TTS con fade-out corto y captura su frase.
@@ -184,11 +191,22 @@ FAST_MODEL = "qwen2.5:3b"
 # Modelo pesado: solo function calling y resumen tras tools.
 LLM_MODEL = "qwen2.5:14b"
 
+# num_ctx explícito evita que Ollama redecida el contexto en cada request.
+# num_predict acota la respuesta: es voz, no un ensayo.
+LLM_CHAT_OPTIONS = {
+    "num_ctx": 2048,
+    "num_predict": 96,
+    "temperature": 0.6,
+    "top_k": 20,
+}
+
 # STT: medium es más preciso que small (cuesta algo más de latencia en GPU).
 # WHISPER_MODEL_SIZE = "tiny"
 # WHISPER_MODEL_SIZE = "small"
 WHISPER_MODEL_SIZE = "medium"
-WHISPER_BEAM_SIZE = 5
+# beam 1: con temperature 0.0 el beam search apenas cambia el resultado y
+# cuesta bastante latencia. best_of solo aplica con muestreo, así que va a 1.
+WHISPER_BEAM_SIZE = 1
 
 STT_INITIAL_PROMPT = (
     "El usuario habla en español claro con Kimmi. "
@@ -207,12 +225,43 @@ TTS_ENGINE = TTS_ENGINE.strip().lower()
 if TTS_ENGINE not in ("kokoro", "piper"):
     raise ValueError(f"TTS_ENGINE inválido: {TTS_ENGINE!r}. Usa 'kokoro' o 'piper'.")
 
-kokoro = None
-if TTS_ENGINE == "kokoro":
+def _load_kokoro():
+    """Load Kokoro preferring CUDA.
+
+    kokoro-onnx hardcodes CPUExecutionProvider and its GPU branch checks
+    find_spec("onnxruntime-gpu"), which can never match because the module is
+    named onnxruntime. Building the session here is the only way to get CUDA
+    while keeping CPU as a fallback inside the same provider list.
+    torch is imported above, so its CUDA/cuDNN DLLs are already in the process.
+    """
     from kokoro_onnx import Kokoro
 
     print(f"Cargando Kokoro TTS ({KOKORO_VOICE})...")
-    kokoro = Kokoro(KOKORO_MODEL, KOKORO_VOICES)
+    try:
+        import onnxruntime as ort
+
+        options = ort.SessionOptions()
+        # Errors only: the CUDA EP is chatty at load and the bridges parse stdout.
+        options.log_severity_level = 3
+        session = ort.InferenceSession(
+            KOKORO_MODEL,
+            sess_options=options,
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+        engine = Kokoro.from_session(session, KOKORO_VOICES)
+        providers = session.get_providers()
+        print(f"  Kokoro providers: {providers}")
+        if "CUDAExecutionProvider" not in providers:
+            print("  Kokoro corriendo en CPU: la síntesis será ~4x más lenta.")
+        return engine
+    except Exception as exc:  # noqa: BLE001
+        print(f"  Kokoro GPU no disponible ({exc}); usando CPU.")
+        return Kokoro(KOKORO_MODEL, KOKORO_VOICES)
+
+
+kokoro = None
+if TTS_ENGINE == "kokoro":
+    kokoro = _load_kokoro()
 else:
     print(f"Usando Piper TTS ({PIPER_MODEL})...")
 
@@ -243,6 +292,14 @@ vad_model, _ = torch.hub.load(
     force_reload=False,
     onnx=False,
 )
+# Second instance for the barge-in thread. Silero is stateful, so sharing one
+# model between the capture loop and the monitor thread would corrupt it.
+barge_vad_model, _ = torch.hub.load(
+    repo_or_dir="snakers4/silero-vad",
+    model="silero_vad",
+    force_reload=False,
+    onnx=False,
+)
 
 print("Cargando Faster-Whisper (STT)...")
 print(f"  Modelo Whisper: {WHISPER_MODEL_SIZE} (beam={WHISPER_BEAM_SIZE})")
@@ -257,8 +314,10 @@ audio = pyaudio.PyAudio()
 # Timestamp monotonic hasta el cual se ignoran wake words (anti-eco TTS).
 _wake_ignore_until = 0.0
 
-# Memoria
-memory_db = KimmiMemory()
+# El system prompt no cambia entre turnos: calcularlo una vez mantiene el
+# prefijo del LLM byte-idéntico y permite reutilizar el cache de KV.
+SYSTEM_PROMPT = build_system_prompt(ALLOWED_DATA_ROOT)
+
 
 def suppress_wake_word(seconds: float = WAKE_COOLDOWN_SEC) -> None:
     """Bloquea detección de wake word durante N segundos."""
@@ -412,31 +471,8 @@ def _apply_seed_audio_to_recording(
 
 
 # --- REPRODUCCIÓN Y SÍNTESIS DE AUDIO ---
-# Flags de la reproducción en curso (barge-in).
-_tts_barge_in = threading.Event()
-_tts_skip_remaining = threading.Event()
-# Audio capturado del usuario durante barge-in (para no pedirle que repita).
-_barge_in_audio_bytes: Optional[bytes] = None
-_barge_in_audio_lock = threading.Lock()
-
-
-def take_barge_in_audio() -> Optional[bytes]:
-    """Consume el audio capturado en el último barge-in (o None)."""
-    global _barge_in_audio_bytes
-    with _barge_in_audio_lock:
-        data = _barge_in_audio_bytes
-        _barge_in_audio_bytes = None
-        return data
-
-
-def _store_barge_in_audio(data: bytes) -> None:
-    global _barge_in_audio_bytes
-    with _barge_in_audio_lock:
-        _barge_in_audio_bytes = data if data else None
-
-
 def _apply_fade_in(waveform: np.ndarray, sample_rate: int, fade_ms: int) -> np.ndarray:
-    """Fade-in lineal al inicio del audio con habla (tras el lead-in)."""
+    """Fade-in lineal al inicio del primer chunk del turno."""
     if fade_ms <= 0 or waveform.size == 0:
         return waveform
     n = min(len(waveform), int(sample_rate * (fade_ms / 1000.0)))
@@ -447,29 +483,15 @@ def _apply_fade_in(waveform: np.ndarray, sample_rate: int, fade_ms: int) -> np.n
     return out
 
 
-def _prepare_kokoro_waveform(samples, sample_rate: int) -> np.ndarray:
-    waveform = np.asarray(samples, dtype=np.float32)
-    if waveform.ndim > 1:
-        waveform = waveform.reshape(-1)
-
-    lead = int(sample_rate * (KOKORO_LEAD_IN_MS / 1000.0))
-    trail = int(sample_rate * (KOKORO_TRAIL_MS / 1000.0))
-    speech = _apply_fade_in(waveform, sample_rate, KOKORO_FADE_IN_MS)
-    parts = []
-    if lead > 0:
-        parts.append(np.zeros(lead, dtype=np.float32))
-    parts.append(speech)
-    if trail > 0:
-        parts.append(np.zeros(trail, dtype=np.float32))
-    return np.concatenate(parts) if parts else speech
-
-
 def _mic_chunk_is_user_speech(
     audio_bytes: bytes,
     vad_threshold: float = BARGE_IN_VAD_THRESHOLD,
     min_rms: float = BARGE_IN_MIN_RMS,
 ) -> bool:
-    """Heurística anti-eco: VAD alto + energía suficiente."""
+    """Heurística anti-eco: VAD alto + energía suficiente.
+
+    Runs on the barge-in thread, so it uses its own Silero instance.
+    """
     audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
     audio_float32 = audio_int16.astype(np.float32) / 32768.0
     rms = float(np.sqrt(np.mean(np.square(audio_float32)))) if audio_float32.size else 0.0
@@ -477,150 +499,81 @@ def _mic_chunk_is_user_speech(
         return False
     tensor_chunk = torch.from_numpy(audio_float32)
     try:
-        speech_prob = float(vad_model(tensor_chunk, RATE).item())
+        speech_prob = float(barge_vad_model(tensor_chunk, RATE).item())
     except Exception:
         return False
     return speech_prob >= vad_threshold
 
 
-def _capture_barge_in_utterance(
-    monitor,
-    seed_frames: List[bytes],
-) -> bytes:
-    """Tras cortar el TTS, sigue grabando hasta silencio para completar la frase."""
-    frames: List[bytes] = list(seed_frames)
-    chunk_duration_sec = VAD_CHUNK / RATE
-    max_silent_chunks = max(1, int(BARGE_IN_CAPTURE_SILENCE_SEC / chunk_duration_sec))
-    max_total_chunks = int(MAX_RECORD_SEC / chunk_duration_sec)
-    silent_chunks = 0
-    total = 0
-
-    # Tras cortar el TTS, umbral algo más bajo (ya no compite tanto el altavoz).
-    while total < max_total_chunks:
-        try:
-            mic_data = monitor.read(VAD_CHUNK, exception_on_overflow=False)
-        except Exception:
-            break
-        total += 1
-        frames.append(mic_data)
-        if _mic_chunk_is_user_speech(mic_data, vad_threshold=0.55, min_rms=0.015):
-            silent_chunks = 0
-        else:
-            silent_chunks += 1
-            if silent_chunks >= max_silent_chunks:
-                break
-
-    return b"".join(frames)
+def _open_barge_in_stream():
+    """Dedicated input stream for the barge-in monitor thread."""
+    return audio.open(
+        format=FORMAT,
+        channels=CHANNELS,
+        rate=RATE,
+        input=True,
+        frames_per_buffer=VAD_CHUNK,
+    )
 
 
-def _play_waveform_kokoro(
-    waveform: np.ndarray,
-    sample_rate: int,
-    allow_barge_in: bool,
-) -> None:
-    """Reproduce waveform. Si hay barge-in: fade-out, corta y captura la frase del usuario."""
-    if waveform.size == 0:
-        return
+audio_sink = AudioSink(
+    sample_rate=DEFAULT_SAMPLE_RATE,
+    on_first_audio=lambda: perf.mark("ttfa"),
+)
 
-    block = max(256, int(sample_rate * 0.032))  # ~32 ms
-    chunk_ms = 1000.0 * VAD_CHUNK / RATE
-    elapsed_ms = 0.0
-    speech_run_ms = 0.0
-    barge_latched = False
-    pos = 0
-    speech_seed: List[bytes] = []
-
-    monitor = None
-    if allow_barge_in and BARGE_IN_ENABLED:
-        try:
-            monitor = audio.open(
-                format=FORMAT,
-                channels=CHANNELS,
-                rate=RATE,
-                input=True,
-                frames_per_buffer=VAD_CHUNK,
-            )
-            vad_model.reset_states()
-        except Exception as exc:  # noqa: BLE001
-            print(f"  [Barge-in]: no se pudo abrir mic monitor ({exc})")
-            monitor = None
-
-    try:
-        with sd.OutputStream(
-            samplerate=sample_rate,
-            channels=1,
-            dtype="float32",
-            blocksize=block,
-        ) as stream:
-            # Calentar dispositivo (evita cortar el ataque de la primera sílaba).
-            warm = int(sample_rate * (TTS_DEVICE_WARMUP_MS / 1000.0))
-            if warm > 0:
-                stream.write(np.zeros((warm, 1), dtype=np.float32))
-
-            while pos < len(waveform):
-                end = min(pos + block, len(waveform))
-                chunk = waveform[pos:end]
-                stream.write(chunk.reshape(-1, 1))
-                pos = end
-                elapsed_ms += 1000.0 * len(chunk) / sample_rate
-
-                if (
-                    monitor is not None
-                    and not barge_latched
-                    and elapsed_ms >= BARGE_IN_GRACE_MS
-                ):
-                    try:
-                        mic_data = monitor.read(VAD_CHUNK, exception_on_overflow=False)
-                    except Exception:
-                        continue
-                    if _mic_chunk_is_user_speech(mic_data):
-                        speech_seed.append(mic_data)
-                        speech_run_ms += chunk_ms
-                        if speech_run_ms >= BARGE_IN_MIN_SPEECH_MS:
-                            barge_latched = True
-                            _tts_barge_in.set()
-                            _tts_skip_remaining.set()
-                            print(
-                                "  [Barge-in]: te escuché; corto y te atiendo."
-                            )
-                            # Fade-out corto y salir (no terminar listas largas).
-                            fade_n = int(sample_rate * (BARGE_IN_FADE_OUT_MS / 1000.0))
-                            if fade_n > 0 and pos < len(waveform):
-                                tail = waveform[pos : pos + fade_n].astype(np.float32)
-                                if tail.size:
-                                    tail = tail * np.linspace(
-                                        1.0, 0.0, num=len(tail), dtype=np.float32
-                                    )
-                                    stream.write(tail.reshape(-1, 1))
-                            break
-                    else:
-                        speech_run_ms = 0.0
-                        speech_seed.clear()
-
-            # Capturar el resto de la frase del usuario con el mic ya abierto.
-            if barge_latched and monitor is not None:
-                try:
-                    captured = _capture_barge_in_utterance(monitor, speech_seed)
-                    _store_barge_in_audio(captured)
-                    print(
-                        f"  [Barge-in]: capturados {len(captured)} bytes de audio"
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    print(f"  [Barge-in]: no se pudo capturar audio ({exc})")
-    finally:
-        if monitor is not None:
-            try:
-                monitor.stop_stream()
-                monitor.close()
-            except Exception:
-                pass
+barge_in_monitor = BargeInMonitor(
+    open_stream=_open_barge_in_stream,
+    is_user_speech=_mic_chunk_is_user_speech,
+    reset_vad=barge_vad_model.reset_states,
+    chunk_frames=VAD_CHUNK,
+    chunk_ms=1000.0 * VAD_CHUNK / RATE,
+    grace_ms=BARGE_IN_GRACE_MS,
+    min_speech_ms=BARGE_IN_MIN_SPEECH_MS,
+    capture_silence_sec=BARGE_IN_CAPTURE_SILENCE_SEC,
+    max_capture_sec=MAX_RECORD_SEC,
+    speech_threshold=BARGE_IN_VAD_THRESHOLD,
+    speech_min_rms=BARGE_IN_MIN_RMS,
+    # Once the TTS is cut the speaker no longer competes, so relax a bit.
+    capture_threshold=0.55,
+    capture_min_rms=0.015,
+)
 
 
-def play_tts_piper(text: str, allow_barge_in: bool = False):
-    """Sintetiza texto a voz con Piper y reproduce el WAV."""
-    if not text.strip():
-        return
+def take_barge_in_audio() -> Optional[bytes]:
+    """Consume el audio capturado en el último barge-in (o None)."""
+    return barge_in_monitor.take_audio()
 
+
+def _synthesize_chunk(text: str, is_first: bool) -> Optional[np.ndarray]:
+    """Synthesize one chunk at the sink's sample rate. Runs on the TTS thread."""
+    if not text or not text.strip():
+        return None
+
+    started = time.monotonic()
+    if TTS_ENGINE == "piper":
+        waveform, sample_rate = _synthesize_piper(text)
+    else:
+        samples, sample_rate = kokoro.create(
+            text,
+            voice=KOKORO_VOICE,
+            speed=KOKORO_SPEED,
+            lang=KOKORO_LANG,
+        )
+        waveform = np.asarray(samples, dtype=np.float32).reshape(-1)
+
+    if waveform is None or waveform.size == 0:
+        return None
+    if sample_rate != audio_sink.sample_rate:
+        waveform = linear_resample(waveform, sample_rate, audio_sink.sample_rate)
+
+    if is_first:
+        waveform = _apply_fade_in(waveform, audio_sink.sample_rate, KOKORO_FADE_IN_MS)
+        perf.duration("synth1", (time.monotonic() - started) * 1000.0)
+    return waveform
+
+
+def _synthesize_piper(text: str) -> Tuple[Optional[np.ndarray], int]:
+    """Piper fallback engine; kept working but no longer the default path."""
     wav_output = "temp_sentence.wav"
     cmd_piper = [PIPER_EXE, "--model", PIPER_MODEL, "--output_file", wav_output]
     process = subprocess.Popen(
@@ -633,107 +586,34 @@ def play_tts_piper(text: str, allow_barge_in: bool = False):
     process.communicate(input=text)
     if process.returncode != 0 or not os.path.exists(wav_output):
         print(f"  [TTS Piper]: error sintetizando (code={process.returncode})")
-        return
+        return None, audio_sink.sample_rate
 
-    wf = wave.open(wav_output, "rb")
-    frames = wf.readframes(wf.getnframes())
-    channels = wf.getnchannels()
-    sampwidth = wf.getsampwidth()
-    framerate = wf.getframerate()
-    wf.close()
+    with wave.open(wav_output, "rb") as wf:
+        frames = wf.readframes(wf.getnframes())
+        channels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        framerate = wf.getframerate()
 
-    if sampwidth == 2:
-        audio_i16 = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-    else:
-        # Fallback simple: reproducción bloqueante clásica
-        wf = wave.open(wav_output, "rb")
-        p_out = pyaudio.PyAudio()
-        stream_out = p_out.open(
-            format=p_out.get_format_from_width(wf.getsampwidth()),
-            channels=wf.getnchannels(),
-            rate=wf.getframerate(),
-            output=True,
-        )
-        data = wf.readframes(1024)
-        while data:
-            stream_out.write(data)
-            data = wf.readframes(1024)
-        stream_out.stop_stream()
-        stream_out.close()
-        p_out.terminate()
-        wf.close()
-        return
+    if sampwidth != 2:
+        print(f"  [TTS Piper]: formato no soportado (sampwidth={sampwidth})")
+        return None, framerate
 
+    waveform = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
     if channels > 1:
-        audio_i16 = audio_i16.reshape(-1, channels).mean(axis=1)
-    # Reutilizar el mismo path interruptible (resample no; Piper suele ser 22050).
-    _play_waveform_kokoro(audio_i16, framerate, allow_barge_in=allow_barge_in)
+        waveform = waveform.reshape(-1, channels).mean(axis=1)
+    return waveform, framerate
 
 
-def play_tts_kokoro(text: str, allow_barge_in: bool = True):
-    """Sintetiza texto a voz con Kokoro y reproduce (con barge-in opcional)."""
-    if not text.strip() or kokoro is None:
-        return
-    samples, sample_rate = kokoro.create(
-        text,
-        voice=KOKORO_VOICE,
-        speed=KOKORO_SPEED,
-        lang="es",
-    )
-    waveform = _prepare_kokoro_waveform(samples, sample_rate)
-    _play_waveform_kokoro(waveform, sample_rate, allow_barge_in=allow_barge_in)
-
-
-def play_tts_sentence(text: str, allow_barge_in: bool = True):
-    """Despacha al motor TTS configurado en TTS_ENGINE."""
-    if TTS_ENGINE == "piper":
-        play_tts_piper(text, allow_barge_in=allow_barge_in)
-    else:
-        play_tts_kokoro(text, allow_barge_in=allow_barge_in)
-    # Tras hablar, el mic suele captar el eco → no aceptar wake word un momento.
-    suppress_wake_word(WAKE_COOLDOWN_SEC)
-
-
-def _drain_sentence_queue(sentence_queue: queue.Queue) -> None:
-    """Vacía oraciones pendientes tras barge-in."""
-    while True:
-        try:
-            item = sentence_queue.get_nowait()
-        except queue.Empty:
-            break
-        sentence_queue.task_done()
-        if item is None:
-            break
-
-
-def tts_worker(sentence_queue: queue.Queue, allow_barge_in: bool = True):
-    """Worker: reproduce oraciones; si hay barge-in, no lanza las siguientes."""
-    while True:
-        if _tts_skip_remaining.is_set():
-            _drain_sentence_queue(sentence_queue)
-            break
-
-        sentence = sentence_queue.get()
-        if sentence is None:
-            sentence_queue.task_done()
-            break
-
-        if _tts_skip_remaining.is_set():
-            sentence_queue.task_done()
-            _drain_sentence_queue(sentence_queue)
-            break
-
-        play_tts_sentence(sentence, allow_barge_in=allow_barge_in)
-        sentence_queue.task_done()
-
-        if _tts_barge_in.is_set():
-            _tts_skip_remaining.set()
-            _drain_sentence_queue(sentence_queue)
-            break
+speech = SpeechPipeline(
+    synthesize=_synthesize_chunk,
+    sink=audio_sink,
+    monitor=barge_in_monitor,
+    fade_out_ms=BARGE_IN_FADE_OUT_MS,
+)
 
 
 def speak_text(text: str, allow_barge_in: bool = True) -> bool:
-    """Reproduce una o más oraciones por TTS (bloqueante).
+    """Reproduce texto por TTS (bloqueante hasta que termina el audio).
 
     Devuelve True si hubo barge-in. El audio del usuario queda en
     take_barge_in_audio() para no pedirle que repita.
@@ -741,38 +621,21 @@ def speak_text(text: str, allow_barge_in: bool = True) -> bool:
     if not text or not text.strip():
         return False
 
-    _tts_barge_in.clear()
-    _tts_skip_remaining.clear()
-    _store_barge_in_audio(b"")  # limpia captura previa
-
     print(f"[Kimmi]: {text}")
-    sentence_queue: queue.Queue = queue.Queue()
-    tts_thread = threading.Thread(
-        target=tts_worker,
-        args=(sentence_queue, allow_barge_in and BARGE_IN_ENABLED),
-    )
-    tts_thread.start()
-    sentence_regex = re.compile(r"([^.!?\n]+[.!?\n]+)")
-    buffer = text.strip()
-    for match in sentence_regex.findall(buffer):
-        if _tts_skip_remaining.is_set():
-            break
-        sentence_queue.put(match.strip())
-        buffer = buffer[len(match) :]
-    if buffer.strip() and not _tts_skip_remaining.is_set():
-        sentence_queue.put(buffer.strip())
-    sentence_queue.put(None)
-    tts_thread.join()
-    return _tts_barge_in.is_set()
+    speech.begin_turn(allow_barge_in=allow_barge_in and BARGE_IN_ENABLED)
+    speech.feed(text.strip())
+    barged = speech.end_turn()
+    # Tras hablar, el mic capta el eco → no aceptar wake word un momento.
+    suppress_wake_word(WAKE_COOLDOWN_SEC)
+    return barged
 
 
 def speak_wake_ack():
     """Acuse inmediato tras la wake word; frase aleatoria."""
     template = random.choice(WAKE_ACK_PHRASES)
     ack = template.format(name=USER_NAME)
-    print(f"[Kimmi]: {ack}")
     # Sin barge-in en el acuse corto (muy breve y fácil de confundir con eco).
-    play_tts_sentence(ack, allow_barge_in=False)
+    speak_text(ack, allow_barge_in=False)
 
 
 def is_conversation_closing(text: str) -> bool:
@@ -930,15 +793,12 @@ def transcribe_audio(audio_bytes: bytes) -> Tuple[str, bool]:
         wf.writeframes(audio_bytes)
 
     wav_buffer.seek(0)
+    # No vad_filter: record_user_audio_vad ya recortó el audio con Silero,
+    # así que volver a correr VAD aquí sería trabajo duplicado.
     segments_iter, _info = whisper_model.transcribe(
         wav_buffer,
         language="es",
         task="transcribe",
-        vad_filter=True,
-        vad_parameters=dict(
-            min_silence_duration_ms=400,
-            speech_pad_ms=200,
-        ),
         beam_size=WHISPER_BEAM_SIZE,
         best_of=WHISPER_BEAM_SIZE,
         temperature=0.0,
@@ -974,16 +834,20 @@ def transcribe_audio(audio_bytes: bytes) -> Tuple[str, bool]:
 
 def stream_ollama_to_tts(
     messages,
-    sentence_queue,
     model: str = FAST_MODEL,
     tools=None,
 ) -> str:
-    """Stream Ollama → TTS por oraciones. Devuelve el texto completo."""
+    """Stream Ollama → TTS por chunks. Devuelve el texto completo.
+
+    El print incremental del marker [Kimmi]: es contrato con desktop/bridge.py,
+    que lo consume carácter a carácter para animar la onda.
+    """
     kwargs: Dict[str, Any] = {
         "model": model,
         "messages": messages,
         "keep_alive": "24h",
         "stream": True,
+        "options": dict(LLM_CHAT_OPTIONS),
     }
     if tools is not None:
         kwargs["tools"] = tools
@@ -991,29 +855,18 @@ def stream_ollama_to_tts(
     stream = ollama.chat(**kwargs)
 
     print("[Kimmi]: ", end="", flush=True)
-    text_buffer = ""
     full_text = ""
-    sentence_regex = re.compile(r"([^.!?\n]+[.!?\n]+)")
 
     for chunk in stream:
         content = chunk["message"].get("content") or ""
         if not content:
             continue
+        perf.mark("llm_ttft")
         print(content, end="", flush=True)
-        text_buffer += content
         full_text += content
-
-        matches = sentence_regex.findall(text_buffer)
-        if matches:
-            for match in matches:
-                if _tts_skip_remaining.is_set():
-                    text_buffer = ""
-                    break
-                sentence_queue.put(match)
-                text_buffer = text_buffer[len(match) :]
-
-    if text_buffer.strip() and not _tts_skip_remaining.is_set():
-        sentence_queue.put(text_buffer.strip())
+        speech.feed(content)
+        if speech.barge_in_happened():
+            break
 
     print()
     return full_text.strip()
@@ -1026,15 +879,21 @@ def _truncate(text: str, max_chars: int = TOOL_RESULT_MAX_CHARS) -> str:
 
 
 def _build_messages(
-    system_prompt: str,
     history: List[Dict[str, Any]],
     user_text: str,
+    memory_block: str = "",
 ) -> List[Dict[str, Any]]:
+    """Arma los mensajes dejando el prefijo estable entre turnos.
+
+    El bloque de memoria va pegado al mensaje del usuario, no al system, para
+    que [system] + history sea byte-idéntico y el KV cache se reutilice.
+    """
     max_msgs = HISTORY_MAX_TURNS * 2
+    content = f"{user_text}\n\n{memory_block}" if memory_block else user_text
     return (
-        [{"role": "system", "content": system_prompt}]
+        [{"role": "system", "content": SYSTEM_PROMPT}]
         + history[-max_msgs:]
-        + [{"role": "user", "content": user_text}]
+        + [{"role": "user", "content": content}]
     )
 
 
@@ -1059,18 +918,12 @@ def _confirm_action(stream, fn_name: str, fn_args: dict) -> bool:
 
 
 def _chat_reply(messages: List[Dict[str, Any]], model: str) -> str:
-    _tts_barge_in.clear()
-    _tts_skip_remaining.clear()
-    _store_barge_in_audio(b"")
-    sentence_queue: queue.Queue = queue.Queue()
-    tts_thread = threading.Thread(
-        target=tts_worker,
-        args=(sentence_queue, BARGE_IN_ENABLED),
-    )
-    tts_thread.start()
-    final = stream_ollama_to_tts(messages, sentence_queue, model=model)
-    sentence_queue.put(None)
-    tts_thread.join()
+    speech.begin_turn(allow_barge_in=BARGE_IN_ENABLED)
+    try:
+        final = stream_ollama_to_tts(messages, model=model)
+    finally:
+        speech.end_turn()
+        suppress_wake_word(WAKE_COOLDOWN_SEC)
     return final or "Listo."
 
 
@@ -1151,17 +1004,15 @@ def handle_user_turn(
 
     # RAG: recuperar recuerdos relevantes antes de llamar al LLM.
     retrieved_context = ""
-    try:
-        retrieved_context = memory_db.search_memory(user_text, n_results=3)
-    except Exception as exc:  # noqa: BLE001
-        print(f"  [Memoria]: fallo RAG: {exc}")
+    with perf.span("rag"):
+        try:
+            retrieved_context = memory_db.search_memory(user_text, n_results=3)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [Memoria]: fallo RAG: {exc}")
     if retrieved_context:
         print(f"\n[RAG Memoria]:\n{retrieved_context}")
 
-    system_prompt = build_system_prompt(
-        ALLOWED_DATA_ROOT,
-        memory_context=retrieved_context,
-    )
+    memory_block = format_memory_block(retrieved_context)
 
     # Si el asistente ofreció recordar y el usuario confirma, forzar remember_fact.
     force_memory = ENABLE_TOOLS and should_force_memory_save(user_text, history)
@@ -1176,7 +1027,7 @@ def handle_user_turn(
         else:
             force_memory = False
 
-    messages = _build_messages(system_prompt, history, effective_user_text)
+    messages = _build_messages(history, effective_user_text, memory_block)
 
     # --- Modo rápido (sin router de intents) ---
     if not ENABLE_INTENT_ROUTER:
@@ -1224,11 +1075,16 @@ def handle_user_turn(
 
 
 def _prepare_listen(mic_stream) -> None:
-    """Anti-eco antes de volver a grabar (flush + cooldown corto)."""
+    """Anti-eco antes de volver a grabar (flush + pausa corta).
+
+    En sesión activa el wake word no se usa, así que aquí solo interesa el eco
+    residual del altavoz: esperar el cooldown completo del wake word metía más
+    de un segundo de tiempo muerto antes de cada turno de seguimiento.
+    """
     flush_mic_stream(mic_stream)
     reset_wake_word_model()
-    # Esperar a que termine el cooldown de eco del TTS sin evaluar wake word.
-    while wake_word_suppressed():
+    settle_until = time.monotonic() + MIC_SETTLE_SEC
+    while time.monotonic() < settle_until:
         try:
             mic_stream.read(OWW_CHUNK, exception_on_overflow=False)
         except Exception:
@@ -1276,7 +1132,11 @@ def run_conversation_session(
                 print("  [Sesión]: silencio → fin de conversación")
             break
 
-        user_text, stt_ok = transcribe_audio(user_audio_bytes)
+        # El turno arranca cuando el usuario deja de hablar: todo lo que venga
+        # después es latencia que él percibe.
+        perf.start_turn()
+        with perf.span("stt"):
+            user_text, stt_ok = transcribe_audio(user_audio_bytes)
         if first_turn and stt_ok:
             stripped = strip_wake_phrase(user_text)
             if stripped != user_text:
@@ -1291,7 +1151,9 @@ def run_conversation_session(
                 if not user_audio_bytes:
                     speak_text("No te escuché. Cuando quieras, vuelve a llamarme.")
                     break
-                user_text, stt_ok = transcribe_audio(user_audio_bytes)
+                perf.start_turn()
+                with perf.span("stt"):
+                    user_text, stt_ok = transcribe_audio(user_audio_bytes)
                 if stt_ok:
                     user_text = strip_wake_phrase(user_text)
 
@@ -1301,6 +1163,7 @@ def run_conversation_session(
 
         if not stt_ok or not (user_text or "").strip():
             speak_text("No te escuché bien, ¿puedes repetir?")
+            perf.finish_turn()
             continue
 
         closing = is_conversation_closing(user_text)
@@ -1311,6 +1174,7 @@ def run_conversation_session(
             conversation_history,
             mic_stream,
         )
+        perf.finish_turn()
 
         conversation_history.append({"role": "user", "content": user_text})
         conversation_history.append({
@@ -1359,6 +1223,57 @@ def capture_after_wake_word(mic_stream, ring_chunks: deque) -> Tuple[Optional[by
     return None, False
 
 
+def warmup() -> None:
+    """Pay the one-off costs at boot instead of on the user's first turn.
+
+    Covers the Ollama model load, the embedding model, Kokoro's first ONNX run
+    (which also initializes espeak) and Whisper's CUDA allocation.
+    """
+    print("Calentando modelos...")
+
+    try:
+        ollama.chat(
+            model=FAST_MODEL,
+            messages=[{"role": "user", "content": "hi"}],
+            keep_alive="24h",
+            options={"num_predict": 1, "num_ctx": LLM_CHAT_OPTIONS["num_ctx"]},
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [Warmup]: Ollama {FAST_MODEL} no respondió ({exc})")
+
+    if ENABLE_TOOLS:
+        try:
+            ollama.chat(
+                model=LLM_MODEL,
+                messages=[{"role": "user", "content": "hi"}],
+                keep_alive="24h",
+                options={"num_predict": 1},
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [Warmup]: Ollama {LLM_MODEL} no respondió ({exc})")
+
+    try:
+        memory_db.warmup()
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [Warmup]: embeddings no disponibles ({exc})")
+
+    if kokoro is not None:
+        try:
+            kokoro.create(
+                "Listo.",
+                voice=KOKORO_VOICE,
+                speed=KOKORO_SPEED,
+                lang=KOKORO_LANG,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [Warmup]: Kokoro falló ({exc})")
+
+    try:
+        transcribe_audio(b"\x00\x00" * (RATE // 2))
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [Warmup]: Whisper falló ({exc})")
+
+
 def main():
     mic_stream = audio.open(
         format=FORMAT,
@@ -1367,6 +1282,10 @@ def main():
         input=True,
         frames_per_buffer=OWW_CHUNK,
     )
+
+    audio_sink.start()
+    barge_in_monitor.start()
+    warmup()
 
     conversation_history: List[Dict[str, Any]] = []
     ring_maxlen = max(1, int(WAKE_RING_BUFFER_SEC * RATE / OWW_CHUNK))
@@ -1418,6 +1337,9 @@ def main():
     except KeyboardInterrupt:
         print("\nCerrando Kimmi...")
     finally:
+        speech.close()
+        barge_in_monitor.close()
+        audio_sink.close()
         mic_stream.stop_stream()
         mic_stream.close()
         audio.terminate()

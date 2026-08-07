@@ -443,15 +443,24 @@ def tools_for_intent(intent: str, tools_schema: List[dict]) -> List[dict]:
     return filtered
 
 
-def build_system_prompt(allowed_root: str, memory_context: str = "") -> str:
+def format_memory_block(memory_context: str) -> str:
+    """Bloque de recuerdos que se adjunta al mensaje del usuario.
+
+    Va en el turno del usuario y no en el system para que el prefijo
+    [system] + history quede byte-idéntico entre turnos y Ollama pueda
+    reutilizar el cache de KV en vez de re-prefillear todo el prompt.
+    """
+    if not memory_context or not memory_context.strip():
+        return ""
+    return (
+        "Recuerdos relevantes recuperados de tu memoria permanente "
+        "(úsalos solo si ayudan a responder; no inventes otros):\n"
+        f"{memory_context.strip()}"
+    )
+
+
+def build_system_prompt(allowed_root: str) -> str:
     apps = ", ".join(list_allowed_app_ids())
-    memory_block = ""
-    if memory_context and memory_context.strip():
-        memory_block = (
-            "\n\nRecuerdos relevantes recuperados de tu memoria permanente "
-            "(úsalos solo si ayudan a responder; no inventes otros):\n"
-            f"{memory_context.strip()}\n"
-        )
 
     return (
         "Eres Kimmi, un asistente local de voz: conciso, directo y útil. "
@@ -476,5 +485,4 @@ def build_system_prompt(allowed_root: str, memory_context: str = "") -> str:
         f"Archivos solo dentro de {allowed_root}. "
         f"Apps allowlisted: {apps}. "
         "Usa como máximo una tool por turno."
-        f"{memory_block}"
     )

@@ -6,8 +6,10 @@ Requiere: chromadb, ollama, y el modelo nomic-embed-text (`ollama pull nomic-emb
 from __future__ import annotations
 
 import os
+import re
 import time
 import uuid
+from collections import OrderedDict
 from typing import Any, List, Optional
 
 import chromadb
@@ -20,6 +22,19 @@ DEFAULT_EMBED_MODEL = "nomic-embed-text"
 MAX_DISTANCE = 0.45
 MAX_FACT_CHARS = 800
 MAX_CONTEXT_CHARS = 1200
+# Mantener el modelo de embeddings cargado: sin esto usa el default de 5 min y
+# se descarga/recarga compitiendo con el LLM de chat.
+EMBED_KEEP_ALIVE = "24h"
+# Cache de resultados recientes (query normalizada -> contexto).
+QUERY_CACHE_SIZE = 32
+
+# Un embedding por turno es caro. Saludos y muletillas nunca aportan contexto.
+_SKIP_QUERY_MIN_CHARS = 8
+_SKIP_QUERY_RE = re.compile(
+    r"(?i)^\s*(?:hola|buenas|hey|qu[eé]\s+tal|c[oó]mo\s+est[aá]s|buenos\s+d[ií]as"
+    r"|buenas\s+tardes|buenas\s+noches|s[ií]|no|vale|ok(?:ay)?|dale|gracias)"
+    r"[\s\.\!\?\,]*$"
+)
 
 
 class KimmiMemory:
@@ -36,9 +51,20 @@ class KimmiMemory:
             name="kimmi_knowledge",
             metadata={"hnsw:space": "cosine"},
         )
+        # Contar en Chroma en cada turno es innecesario: solo cambia al escribir.
+        self._count_cache: Optional[int] = None
+        self._query_cache: "OrderedDict[str, str]" = OrderedDict()
+
+    def warmup(self) -> None:
+        """Cargar el modelo de embeddings antes del primer turno real."""
+        self._get_embedding("warm")
 
     def _get_embedding(self, text: str) -> List[float]:
-        response = ollama.embeddings(model=self.embed_model, prompt=text)
+        response = ollama.embeddings(
+            model=self.embed_model,
+            prompt=text,
+            keep_alive=EMBED_KEEP_ALIVE,
+        )
         if isinstance(response, dict) and "embedding" in response:
             return list(response["embedding"])
         embedding = getattr(response, "embedding", None)
@@ -80,7 +106,29 @@ class KimmiMemory:
         except Exception as exc:  # noqa: BLE001
             return f"No se pudo guardar en ChromaDB: {exc}"
 
+        self._count_cache = None
+        self._query_cache.clear()
         return f"Recuerdo guardado ({doc_id})."
+
+    def _cached_count(self) -> int:
+        if self._count_cache is None:
+            try:
+                self._count_cache = int(self.collection.count())
+            except Exception:  # noqa: BLE001
+                return 0
+        return self._count_cache
+
+    def _cache_get(self, key: str) -> Optional[str]:
+        if key in self._query_cache:
+            self._query_cache.move_to_end(key)
+            return self._query_cache[key]
+        return None
+
+    def _cache_put(self, key: str, value: str) -> None:
+        self._query_cache[key] = value
+        self._query_cache.move_to_end(key)
+        while len(self._query_cache) > QUERY_CACHE_SIZE:
+            self._query_cache.popitem(last=False)
 
     def search_memory(self, query: str, n_results: int = 3) -> str:
         """Devuelve bullets con recuerdos relevantes, o cadena vacía."""
@@ -88,12 +136,18 @@ class KimmiMemory:
         if not query:
             return ""
 
-        try:
-            count = self.collection.count()
-        except Exception:
+        # Gate barato antes de pagar el embedding.
+        if len(query) < _SKIP_QUERY_MIN_CHARS or _SKIP_QUERY_RE.match(query):
             return ""
+
+        count = self._cached_count()
         if count == 0:
             return ""
+
+        cache_key = query.lower()
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
 
         k = max(1, min(int(n_results), 5, count))
         try:
@@ -110,6 +164,7 @@ class KimmiMemory:
         documents = (results.get("documents") or [[]])[0]
         distances = (results.get("distances") or [[]])[0]
         if not documents:
+            self._cache_put(cache_key, "")
             return ""
 
         lines: List[str] = []
@@ -140,18 +195,17 @@ class KimmiMemory:
             lines.append(f"- {doc}")
 
         if not lines:
+            self._cache_put(cache_key, "")
             return ""
 
         text = "\n".join(lines)
         if len(text) > MAX_CONTEXT_CHARS:
             text = text[: MAX_CONTEXT_CHARS - 3] + "..."
+        self._cache_put(cache_key, text)
         return text
 
     def count(self) -> int:
-        try:
-            return int(self.collection.count())
-        except Exception:
-            return 0
+        return self._cached_count()
 
 
 # Instancia compartida por el proceso (tool + RAG del bucle).
