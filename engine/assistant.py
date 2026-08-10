@@ -27,7 +27,13 @@ from audio_out import (
     linear_resample,
 )
 from clip_cache import ClipCache, make_signature
-from locale_config import Locale, current_locale
+from locale_config import (
+    LOCALES,
+    Locale,
+    current_locale,
+    match_language_switch,
+    set_locale,
+)
 from tools.app_allowlist import list_allowed_app_ids
 from tools.intent import (
     INTENT_CONFIDENCE_THRESHOLD,
@@ -157,6 +163,20 @@ WHISPER_MODEL_SIZE = "medium"
 # beam 1: con temperature 0.0 el beam search apenas cambia el resultado y
 # cuesta bastante latencia. best_of solo aplica con muestreo, así que va a 1.
 WHISPER_BEAM_SIZE = 1
+# Only used when STT with the active locale already failed (tanda 4 fallback).
+# Bypasses auto-detect hysteresis: the turn was already going to fail.
+LANG_DETECT_MIN_PROB = 0.75
+
+# Tanda 5: conservative auto language detection on the happy path.
+# A separate tiny Whisper runs detect_language in ~15 ms; medium would cost ~2 s
+# (full 30 s encoder pass) and would erase the latency work from tanda 1.
+LANG_AUTO_DETECT_ENABLED = True
+LANG_DETECT_MODEL_SIZE = "tiny"
+LANG_AUTO_MIN_PROB = 0.80
+LANG_AUTO_MIN_AUDIO_SEC = 1.5
+LANG_AUTO_INSTANT_AUDIO_SEC = 2.5
+LANG_AUTO_INSTANT_PROB = 0.90
+LANG_AUTO_HYSTERESIS = 2
 
 _stt_prompt_cache: Dict[str, str] = {}
 
@@ -265,6 +285,12 @@ print("Loading Faster-Whisper (STT)...")
 print(f"  Whisper model: {WHISPER_MODEL_SIZE} (beam={WHISPER_BEAM_SIZE})")
 whisper_model = WhisperModel(
     WHISPER_MODEL_SIZE,
+    device="cuda",
+    compute_type="float16",
+)
+print(f"Loading Whisper language detector ({LANG_DETECT_MODEL_SIZE})...")
+lang_detect_model = WhisperModel(
+    LANG_DETECT_MODEL_SIZE,
     device="cuda",
     compute_type="float16",
 )
@@ -652,6 +678,109 @@ def fixed_phrases(loc: Locale) -> List[str]:
     return phrases
 
 
+def _prime_clips_background(loc: Locale) -> None:
+    """Warm the clip cache for ``loc`` without blocking the turn."""
+    try:
+        reused, synthesized = clip_cache_for(loc).prime(fixed_phrases(loc))
+        print(
+            f"  [Clips]: {reused + synthesized} cached for {loc.code} "
+            f"({synthesized} synthesized, background)"
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [Clips]: background prime failed for {loc.code} ({exc})")
+
+
+def apply_locale_switch(code: str, reason: str) -> Locale:
+    """Swap the active language, log it, and prime clips in the background.
+
+    The switch ack uses ``speak_text``, which falls back to live synthesis if
+    the new locale's clips are not ready yet, so we never block ~5 s here.
+    """
+    old = current_locale().code
+    loc = set_locale(code)
+    print(f"  [Locale]: switched {old} -> {loc.code} ({reason})")
+    reset_auto_lang_state()
+    if reason != "already":
+        thread = threading.Thread(
+            target=_prime_clips_background,
+            args=(loc,),
+            daemon=True,
+            name=f"clip-prime-{loc.code}",
+        )
+        thread.start()
+    return loc
+
+
+# Evidence for auto language switch (tanda 5). Process-local; cleared on switch,
+# on agreeing with the active locale, and when a conversation session ends.
+_pending_auto_lang: Optional[str] = None
+_pending_auto_count: int = 0
+
+
+def reset_auto_lang_state() -> None:
+    """Drop accumulated auto-detect evidence."""
+    global _pending_auto_lang, _pending_auto_count
+    _pending_auto_lang = None
+    _pending_auto_count = 0
+
+
+def _map_whisper_to_locale(lang: str) -> Optional[str]:
+    """Map a Whisper language code onto one of our locale codes, or None."""
+    key = (lang or "").strip().lower()
+    if not key:
+        return None
+    for code, locale in LOCALES.items():
+        if locale.whisper_language == key or code == key:
+            return code
+    return None
+
+
+def maybe_auto_switch(target: Optional[str], prob: float, duration_sec: float) -> bool:
+    """Apply conservative auto-switch policy. Returns True if locale changed.
+
+    Short or low-confidence detections neither switch nor touch the streak.
+    Matching the active locale clears the streak.
+    """
+    global _pending_auto_lang, _pending_auto_count
+
+    if not LANG_AUTO_DETECT_ENABLED:
+        return False
+
+    current = current_locale().code
+    if target is None or target == current:
+        reset_auto_lang_state()
+        return False
+
+    if duration_sec < LANG_AUTO_MIN_AUDIO_SEC or prob < LANG_AUTO_MIN_PROB:
+        return False
+
+    # One long, high-confidence turn is enough.
+    if (
+        duration_sec >= LANG_AUTO_INSTANT_AUDIO_SEC
+        and prob >= LANG_AUTO_INSTANT_PROB
+    ):
+        apply_locale_switch(target, reason="auto")
+        perf.value("lang_switch", target)
+        return True
+
+    if target == _pending_auto_lang:
+        _pending_auto_count += 1
+    else:
+        _pending_auto_lang = target
+        _pending_auto_count = 1
+
+    print(
+        f"  [Locale]: auto pending {target} "
+        f"({_pending_auto_count}/{LANG_AUTO_HYSTERESIS}) "
+        f"p={prob:.2f} dur={duration_sec:.1f}s"
+    )
+    if _pending_auto_count >= LANG_AUTO_HYSTERESIS:
+        apply_locale_switch(target, reason="auto")
+        perf.value("lang_switch", target)
+        return True
+    return False
+
+
 # Un solo relleno por turno: si el camino de tools ya avisó, el chat no repite.
 _filler_played = threading.Event()
 
@@ -847,11 +976,27 @@ def record_user_audio_vad(
     return b"".join(frames)
 
 
-def transcribe_audio(audio_bytes: bytes) -> Tuple[str, bool]:
-    """STT con filtro de calidad. Devuelve (texto, ok)."""
+def _pcm16_to_float32(audio_bytes: bytes) -> np.ndarray:
+    """PCM int16 mono bytes -> float32 waveform in [-1, 1]."""
+    if not audio_bytes:
+        return np.zeros(0, dtype=np.float32)
+    return np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def transcribe_audio(
+    audio_bytes: bytes,
+    loc: Optional[Locale] = None,
+) -> Tuple[str, bool]:
+    """STT con filtro de calidad. Devuelve (texto, ok).
+
+    ``loc`` defaults to the active locale. Pass it explicitly after a mid-turn
+    switch so the re-STT does not race the holder.
+    """
     if not audio_bytes or len(audio_bytes) < RATE * 2 // 10:
         # Menos de ~0.1 s de audio 16-bit mono
         return "", False
+
+    active = loc if loc is not None else current_locale()
 
     wav_buffer = io.BytesIO()
     with wave.open(wav_buffer, "wb") as wf:
@@ -861,19 +1006,18 @@ def transcribe_audio(audio_bytes: bytes) -> Tuple[str, bool]:
         wf.writeframes(audio_bytes)
 
     wav_buffer.seek(0)
-    loc = current_locale()
     # No vad_filter: record_user_audio_vad ya recortó el audio con Silero,
     # así que volver a correr VAD aquí sería trabajo duplicado.
     segments_iter, _info = whisper_model.transcribe(
         wav_buffer,
-        language=loc.whisper_language,
+        language=active.whisper_language,
         task="transcribe",
         beam_size=WHISPER_BEAM_SIZE,
         best_of=WHISPER_BEAM_SIZE,
         temperature=0.0,
         condition_on_previous_text=False,
         without_timestamps=True,
-        initial_prompt=stt_initial_prompt(loc),
+        initial_prompt=stt_initial_prompt(active),
     )
     segments = list(segments_iter)
     if not segments:
@@ -899,6 +1043,88 @@ def transcribe_audio(audio_bytes: bytes) -> Tuple[str, bool]:
     if len(text) < MIN_TRANSCRIPT_CHARS:
         return text, False
     return text, True
+
+
+def _detect_language_sync(
+    audio_f32: np.ndarray,
+) -> Tuple[str, float, Optional[str], float]:
+    """Run language detection on the tiny model. Returns (lang, prob, code, ms)."""
+    started = time.monotonic()
+    lang = ""
+    prob = 0.0
+    target: Optional[str] = None
+    try:
+        # Prefix only: enough signal for en vs es, less work before the pad-to-30s.
+        prefix = audio_f32
+        max_samples = RATE * 3
+        if prefix.size > max_samples:
+            prefix = prefix[:max_samples]
+        lang_raw, prob_raw, _all = lang_detect_model.detect_language(
+            audio=prefix,
+            language_detection_segments=1,
+            language_detection_threshold=0.5,
+        )
+        lang = (lang_raw or "").strip().lower()
+        prob = float(prob_raw)
+        target = _map_whisper_to_locale(lang)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [Locale]: detect_language failed ({exc})")
+    elapsed_ms = (time.monotonic() - started) * 1000.0
+    return lang, prob, target, elapsed_ms
+
+
+def transcribe_for_turn(audio_bytes: bytes) -> Tuple[str, bool]:
+    """STT for a conversation turn with conservative auto language switch.
+
+    Detects language with the tiny Whisper (~15 ms), maybe switches locale,
+    then transcribes with medium. If the policy (or the tanda-4 quality fallback)
+    changes locale after a first failed/wrong pass, re-STTs once.
+
+    Never uses ``language=None``. Confirmation turns must call ``transcribe_audio``
+    directly so a failed yes/no cannot flip the session language.
+    """
+    audio_f32 = _pcm16_to_float32(audio_bytes)
+    duration_sec = float(audio_f32.size) / float(RATE) if audio_f32.size else 0.0
+
+    lang = ""
+    prob = 0.0
+    target: Optional[str] = None
+    can_detect = audio_f32.size >= RATE // 10
+
+    if LANG_AUTO_DETECT_ENABLED and can_detect:
+        lang, prob, target, detect_ms = _detect_language_sync(audio_f32)
+        perf.duration("lang_detect", detect_ms)
+        # Switch (if any) happens *before* STT so we only transcribe once.
+        maybe_auto_switch(target, prob, duration_sec)
+
+    text, ok = transcribe_audio(audio_bytes)
+    if ok:
+        return text, True
+
+    # Tanda 4 fallback: detect now if auto was off; otherwise reuse the result.
+    if not lang and can_detect:
+        lang, prob, target, detect_ms = _detect_language_sync(audio_f32)
+        perf.duration("lang_detect", detect_ms)
+
+    if (
+        target is not None
+        and target != current_locale().code
+        and prob >= LANG_DETECT_MIN_PROB
+    ):
+        new_loc = apply_locale_switch(target, reason="stt-fallback")
+        perf.value("lang_switch", new_loc.code)
+        return transcribe_audio(audio_bytes, loc=new_loc)
+
+    if lang:
+        print(
+            f"  [Locale]: detect_language={lang!r} p={prob:.2f} "
+            f"(no switch; need other lang >= {LANG_DETECT_MIN_PROB})"
+        )
+    return text, False
+
+
+# Back-compat alias used by older call sites / probes.
+transcribe_with_locale_fallback = transcribe_for_turn
 
 
 def stream_ollama_to_tts(
@@ -1074,6 +1300,21 @@ def handle_user_turn(
     """
     _filler_played.clear()
 
+    # Explicit language switch: pre-baked ack in the NEW language, no LLM.
+    target = match_language_switch(user_text)
+    if target is not None:
+        loc = current_locale()
+        if loc.code == target:
+            print(f"  [Locale]: already {loc.code} (command)")
+            reset_auto_lang_state()
+            ack = loc.spoken["language_already"]
+            speak_text(ack)
+            return ack
+        new_loc = apply_locale_switch(target, reason="command")
+        ack = new_loc.spoken["language_switched"]
+        speak_text(ack)
+        return ack
+
     # Cierre conversacional: no LLM, no "¿necesitas algo más?"
     if is_conversation_closing(user_text):
         print("  [Closing]: goodbye/thanks detected")
@@ -1179,101 +1420,105 @@ def run_conversation_session(
     first_turn = True
     pending_audio: Optional[bytes] = initial_audio
 
-    while True:
-        wait_sec = None if first_turn else CONVERSATION_FOLLOWUP_TIMEOUT_SEC
+    try:
+        while True:
+            wait_sec = None if first_turn else CONVERSATION_FOLLOWUP_TIMEOUT_SEC
 
-        if pending_audio is not None:
-            if first_turn:
-                print("\n=== Using post-wake audio (command ran on) ===")
+            if pending_audio is not None:
+                if first_turn:
+                    print("\n=== Using post-wake audio (command ran on) ===")
+                else:
+                    print("\n=== Using barge-in audio ===")
+                user_audio_bytes = pending_audio
+                pending_audio = None
             else:
-                print("\n=== Using barge-in audio ===")
-            user_audio_bytes = pending_audio
-            pending_audio = None
-        else:
-            if not first_turn:
-                print("\n=== Listening (active session) ===")
-                _prepare_listen(mic_stream)
+                if not first_turn:
+                    print("\n=== Listening (active session) ===")
+                    _prepare_listen(mic_stream)
 
-            user_audio_bytes = record_user_audio_vad(
-                mic_stream,
-                max_wait_for_speech_sec=wait_sec,
-            )
+                user_audio_bytes = record_user_audio_vad(
+                    mic_stream,
+                    max_wait_for_speech_sec=wait_sec,
+                )
 
-        if not user_audio_bytes:
-            if first_turn:
-                speak_text(current_locale().spoken["not_heard_session_end"])
-            else:
-                print("  [Session]: silence -> conversation over")
-            break
-
-        # El turno arranca cuando el usuario deja de hablar: todo lo que venga
-        # después es latencia que él percibe.
-        perf.start_turn()
-        play_earcon()
-        with perf.span("stt"):
-            user_text, stt_ok = transcribe_audio(user_audio_bytes)
-        if first_turn and stt_ok:
-            stripped = strip_wake_phrase(user_text)
-            if stripped != user_text:
-                print(f"  [Wake]: cleaned transcript {user_text!r} -> {stripped!r}")
-            user_text = stripped
-            if strip_wake_on_first_turn and not user_text.strip():
-                # Solo wake word en el audio sembrado → acuse y escuchar de verdad.
-                print("  [Wake]: only the wake phrase after strip -> ack + listen")
-                speak_wake_ack()
-                strip_wake_on_first_turn = False
-                user_audio_bytes = record_user_audio_vad(mic_stream)
-                if not user_audio_bytes:
+            if not user_audio_bytes:
+                if first_turn:
                     speak_text(current_locale().spoken["not_heard_session_end"])
-                    break
-                perf.start_turn()
-                play_earcon()
-                with perf.span("stt"):
-                    user_text, stt_ok = transcribe_audio(user_audio_bytes)
-                if stt_ok:
-                    user_text = strip_wake_phrase(user_text)
+                else:
+                    print("  [Session]: silence -> conversation over")
+                break
 
-        print(f"[You]: {user_text!r} (ok={stt_ok})")
-        first_turn = False
-        strip_wake_on_first_turn = False
+            # El turno arranca cuando el usuario deja de hablar: todo lo que venga
+            # después es latencia que él percibe.
+            perf.start_turn()
+            play_earcon()
+            with perf.span("stt"):
+                user_text, stt_ok = transcribe_for_turn(user_audio_bytes)
+            if first_turn and stt_ok:
+                stripped = strip_wake_phrase(user_text)
+                if stripped != user_text:
+                    print(f"  [Wake]: cleaned transcript {user_text!r} -> {stripped!r}")
+                user_text = stripped
+                if strip_wake_on_first_turn and not user_text.strip():
+                    # Solo wake word en el audio sembrado → acuse y escuchar de verdad.
+                    print("  [Wake]: only the wake phrase after strip -> ack + listen")
+                    speak_wake_ack()
+                    strip_wake_on_first_turn = False
+                    user_audio_bytes = record_user_audio_vad(mic_stream)
+                    if not user_audio_bytes:
+                        speak_text(current_locale().spoken["not_heard_session_end"])
+                        break
+                    perf.start_turn()
+                    play_earcon()
+                    with perf.span("stt"):
+                        user_text, stt_ok = transcribe_for_turn(user_audio_bytes)
+                    if stt_ok:
+                        user_text = strip_wake_phrase(user_text)
 
-        if not stt_ok or not (user_text or "").strip():
-            speak_text(current_locale().spoken["not_heard_repeat"])
+            print(f"[You]: {user_text!r} (ok={stt_ok})")
+            first_turn = False
+            strip_wake_on_first_turn = False
+
+            if not stt_ok or not (user_text or "").strip():
+                speak_text(current_locale().spoken["not_heard_repeat"])
+                perf.finish_turn()
+                continue
+
+            closing = is_conversation_closing(user_text)
+            # Limpia captura previa por si acaso; speak_text/_chat_reply la rellenan.
+            take_barge_in_audio()
+            assistant_text = handle_user_turn(
+                user_text,
+                conversation_history,
+                mic_stream,
+            )
             perf.finish_turn()
-            continue
 
-        closing = is_conversation_closing(user_text)
-        # Limpia captura previa por si acaso; speak_text/_chat_reply la rellenan.
-        take_barge_in_audio()
-        assistant_text = handle_user_turn(
-            user_text,
-            conversation_history,
-            mic_stream,
-        )
-        perf.finish_turn()
+            conversation_history.append({"role": "user", "content": user_text})
+            conversation_history.append({
+                "role": "assistant",
+                "content": assistant_text,
+            })
+            max_msgs = HISTORY_MAX_TURNS * 2
+            if len(conversation_history) > max_msgs:
+                conversation_history[:] = conversation_history[-max_msgs:]
 
-        conversation_history.append({"role": "user", "content": user_text})
-        conversation_history.append({
-            "role": "assistant",
-            "content": assistant_text,
-        })
-        max_msgs = HISTORY_MAX_TURNS * 2
-        if len(conversation_history) > max_msgs:
-            conversation_history[:] = conversation_history[-max_msgs:]
+            if closing:
+                print("  [Session]: closing detected")
+                break
 
-        if closing:
-            print("  [Session]: closing detected")
-            break
+            # Si el usuario interrumpió, procesar lo que dijo sin pedirle que repita.
+            barge_audio = take_barge_in_audio()
+            if barge_audio:
+                pending_audio = barge_audio
+                print("  [Session]: barge-in -> next turn uses the captured audio")
+                continue
 
-        # Si el usuario interrumpió, procesar lo que dijo sin pedirle que repita.
-        barge_audio = take_barge_in_audio()
-        if barge_audio:
-            pending_audio = barge_audio
-            print("  [Session]: barge-in -> next turn uses the captured audio")
-            continue
-
-        if not CONVERSATION_MODE:
-            break
+            if not CONVERSATION_MODE:
+                break
+    finally:
+        # Don't carry a half-built streak into the next wake session.
+        reset_auto_lang_state()
 
 
 def capture_after_wake_word(mic_stream, ring_chunks: deque) -> Tuple[Optional[bytes], bool]:
@@ -1361,6 +1606,14 @@ def warmup() -> None:
         transcribe_audio(b"\x00\x00" * (RATE // 2))
     except Exception as exc:  # noqa: BLE001
         print(f"  [Warmup]: Whisper failed ({exc})")
+
+    try:
+        lang_detect_model.detect_language(
+            audio=np.zeros(RATE // 2, dtype=np.float32),
+            language_detection_segments=1,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [Warmup]: language detector failed ({exc})")
 
 
 def main():

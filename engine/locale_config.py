@@ -123,6 +123,8 @@ EN = Locale(
         "force_memory_save": (
             "Yes, use remember_fact to save this exactly: {fact}"
         ),
+        "language_switched": "Alright, switching to English.",
+        "language_already": "I'm already in English.",
     },
     confirm={
         "launch_app_path": "I'm going to open {app} in {path}. Confirm?",
@@ -295,6 +297,8 @@ ES = Locale(
         "force_memory_save": (
             "Sí, usa remember_fact para guardar este dato exactamente: {fact}"
         ),
+        "language_switched": "Vale, hablamos en español.",
+        "language_already": "Ya estoy en español.",
     },
     confirm={
         "launch_app_path": "Voy a abrir {app} en {path}. ¿Confirmas?",
@@ -404,11 +408,60 @@ ES = Locale(
 
 LOCALES: Dict[str, Locale] = {EN.code: EN, ES.code: ES}
 
+# Explicit switch commands. Global (not per-Locale) because the user may ask in
+# either language regardless of the active locale.
+# target_code -> regex matching a request to switch TO that language.
+SWITCH_TO_RE: Dict[str, Pattern[str]] = {
+    "en": re.compile(
+        r"(?i)(?:"
+        r"\b(?:please\s+)?(?:speak|talk)(?:\s+to\s+me)?(?:\s+in)?\s+english\b"
+        r"|\b(?:switch|change)\s+to\s+english\b"
+        r"|\bin\s+english\b"
+        r"|\benglish\s+please\b"
+        r"|\bhabla(?:me)?\s+en\s+ingl[eé]s\b"
+        r"|\bcambia\s+a\s+(?:el\s+)?ingl[eé]s\b"
+        r"|\ben\s+ingl[eé]s(?:\s+por\s+favor)?\b"
+        r")"
+    ),
+    "es": re.compile(
+        r"(?i)(?:"
+        r"\b(?:please\s+)?(?:speak|talk)(?:\s+to\s+me)?(?:\s+in)?\s+spanish\b"
+        r"|\b(?:switch|change)\s+to\s+spanish\b"
+        r"|\bin\s+spanish\b"
+        r"|\bspanish\s+please\b"
+        r"|\bhabla(?:me)?\s+en\s+espa[nñ]ol\b"
+        r"|\bcambia\s+a\s+(?:el\s+)?espa[nñ]ol\b"
+        r"|\ben\s+espa[nñ]ol(?:\s+por\s+favor)?\b"
+        r")"
+    ),
+}
+
 
 def resolve(code: Optional[str]) -> Locale:
     """Look up a locale, falling back to the default for anything unknown."""
     key = (code or "").strip().lower()
     return LOCALES.get(key) or LOCALES[DEFAULT_CODE]
+
+
+def match_language_switch(text: str) -> Optional[str]:
+    """Return target locale code if ``text`` is a switch command, else None.
+
+    If both patterns somehow match, prefer the target that differs from the
+    current locale; otherwise prefer the first hit in SWITCH_TO_RE order.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return None
+    hits = [code for code, pattern in SWITCH_TO_RE.items() if pattern.search(cleaned)]
+    if not hits:
+        return None
+    if len(hits) == 1:
+        return hits[0]
+    current = _current.code
+    for code in hits:
+        if code != current:
+            return code
+    return hits[0]
 
 
 _current: Locale = resolve(os.getenv(ENV_VAR, DEFAULT_CODE))

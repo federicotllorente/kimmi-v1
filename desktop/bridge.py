@@ -75,6 +75,7 @@ def parse_engine_line(line: str) -> Optional[tuple[PipelineState, str]]:
             "[Session]:",
             "[Memory]:",
             "[RAG]:",
+            "[Locale]:",
         )
     ):
         return "processing", text

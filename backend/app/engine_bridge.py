@@ -41,7 +41,14 @@ def parse_engine_line(line: str) -> Optional[tuple[PipelineState, str]]:
 
     if any(
         marker in text
-        for marker in ("[You]:", "[Intent]:", "[LLM]:", "[Tools]:", "[Closing]:")
+        for marker in (
+            "[You]:",
+            "[Intent]:",
+            "[LLM]:",
+            "[Tools]:",
+            "[Closing]:",
+            "[Locale]:",
+        )
     ):
         return "processing", text
 

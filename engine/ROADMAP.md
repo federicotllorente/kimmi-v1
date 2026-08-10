@@ -1,7 +1,7 @@
 # Kimmi — Roadmap de internacionalización y latencia
 
 > Documento de contexto. Recoge el análisis del motor, las decisiones tomadas y el
-> plan por tandas. Sirve como entrada para redactar los planes de las tandas 2, 3 y 4
+> plan por tandas. Sirve como entrada para redactar los planes de las tandas 2–5
 > sin tener que volver a analizar el código desde cero.
 >
 > Última actualización: 2026-08-10
@@ -19,7 +19,8 @@ Kimmi es un asistente de voz local (estilo Jarvis). Desde la tanda 3 soporta **i
    mientras piensa** para que el usuario sienta que fue escuchado.
 
 Conclusión del análisis: el idioma y la latencia son problemas **independientes**. Las
-tandas 1–2 atacaron la latencia; la 3 el idioma; la 4 el cambio en caliente.
+tandas 1–2 atacaron la latencia; la 3 el idioma; la 4 el cambio explícito en caliente;
+la 5 el cambio automático por detección.
 
 ---
 
@@ -272,9 +273,8 @@ Referencia rápida para no volver a comprobarlo:
   `assistant.py` no debe volver a tener un literal hablado; todo lo que se sintetiza sale del locale.
 - **Prompts y schemas de tools en inglés siempre**, con una única línea que fija el idioma de
   respuesta. Un prompt, no dos.
-- **Idioma fijo por sesión**, nunca autodetección por turno (añade latencia a todos los turnos y
-  con audio corto es inestable). El cambio va por comando explícito, con `detect_language` solo
-  como red de seguridad cuando el turno ya iba a fallar.
+- **Cambio de idioma en sesión**: comando explícito (tanda 4) + autodetección conservadora
+  (tanda 5: Whisper `tiny` + histéresis). Sin `language=None` en el STT del camino feliz.
 - **Kokoro a CUDA ya** (`onnxruntime-gpu` + `Kokoro.from_session` con fallback a CPU), en la tanda 1.
 - **Whisper: primero solo `beam_size=1`** y quitar el VAD duplicado, sin descargas.
   `large-v3-turbo` queda como opción medida para más adelante.
@@ -501,29 +501,109 @@ Los turnos cortos se mueven con `synth1` (el inglés a 1.0 es más lento por chu
 1.2, y la primera frase del LLM no es la misma cada tirada). El acuse cacheado sigue en
 `ttfa=0`. Cachés: 27 clips por locale en directorios distintos; segunda ejecución sintetiza 0.
 
-#### Hallazgos para la tanda 4
+#### Hallazgos post tanda 3 (resueltos o arrastrados)
 
-- `set_locale()` ya existe; falta cebar el clip cache del idioma nuevo al cambiar y regenerar el
-  system prompt (hoy se cachea por código de idioma, así que un `set_locale` basta).
+- `set_locale()` + prime de clips en background: resuelto en la tanda 4.
 - qwen2.5:3b sigue fallando aritmética corta ("thirty-four eleven" por 391) en ambos idiomas: no
   es un problema de i18n, pero conviene no fiarse de él para números exactos sin la tool de calc.
 - El modelo aún se escapa a "How can I assist you today?" a veces pese a la prohibición explícita.
 
-### Tanda 4 — Cambio de idioma
+### Tanda 4 — Cambio de idioma (implementada)
+
+> **Estado: hecha.** En la misma sesión, sin reiniciar: comando explícito (camino principal) y
+> `detect_language` solo cuando el STT del locale activo ya falló. Autodetección en el camino
+> feliz = tanda 5.
 
 Tres capas, de más rápida a más lenta:
 
-1. **Comando explícito (~0 ms)**: regex sobre el transcript antes de llamar al LLM —
-   `"speak spanish"`, `"in english"`, `"habla en inglés"`, `"cambia a español"`. Cambia el locale y
-   responde con una frase pregrabada del **nuevo** idioma. Cubre el 95% de los casos reales.
-2. **Fallback por calidad**: si Whisper con el idioma activo devuelve `avg_logprob` malo o el filtro
-   de calidad tumba todos los segmentos, en vez de decir "no te escuché" se corre
-   `whisper_model.detect_language(audio)` y, si detecta el otro idioma con probabilidad alta, se
-   re-transcribe. Solo se paga en el turno que ya iba a fallar.
+1. **Comando explícito (~0 ms)**: `match_language_switch()` sobre el transcript antes del LLM —
+   `"speak spanish"`, `"in english"`, `"habla en inglés"`, `"cambia a español"`, etc.
+   `apply_locale_switch` + frase pregrabada del idioma **nuevo** (`language_switched`). Si ya
+   estaba en ese idioma: `language_already`. Un pedido pegado en el mismo turno se ignora (el
+   STT fue con el idioma viejo).
+2. **Fallback por calidad**: `transcribe_with_locale_fallback` — si el STT falla, corre
+   `detect_language` (umbral 0.75), cambia locale y re-transcribe. No se usa en confirmaciones.
 3. **Nunca** `language=None` en el camino feliz.
 
-Corolario: esto obliga a mantener un STT **multilingüe**, así que quedan descartados `small.en` y
-los `distil-*.en` aunque sean más rápidos.
+Los clips del locale nuevo se ceban en un hilo daemon al cambiar; el ack hace fallback a
+síntesis en vivo si aún no están. Marker `  [Locale]:` → `processing` en ambos bridges.
+
+#### Resultados medidos
+
+- Tabla de comandos: 25/25 (18 positivos + 7 negativos).
+- `en → es` con `"speak Spanish"`: ack `"Vale, hablamos en español."`, voz `ef_dora`; chat
+  siguiente en español (`ttfa=780`).
+- Ya en `es` + `"habla en español"`: `language_already`, sin flip.
+- `es → en` con `"speak English"`: ack en inglés, voz `af_heart`.
+- Camino feliz sin switch: **sin** `lang_detect` / `lang_switch` en `[perf]` (`ttfa=969`).
+- Fallback forzado (STT en falla + audio español): `lang_switch=es`, transcript correcto
+  (`"Hola Kimmi, qué hora es..."`). `lang_detect` ~2 s en ese audio largo; solo se paga cuando
+  el turno ya iba mal.
+- Clip cache: 29 clips por locale; tras el primer switch el prime en background deja 0
+  resíntesis al volver.
+
+### Tanda 5 — Autodetección de idioma (implementada)
+
+> **Estado: hecha.** `detect_language` en el camino feliz con Whisper **`tiny`** (modelo aparte
+> del STT `medium`); switch solo con evidencia fuerte + histéresis. Auto-switch **silencioso**
+> (sin `language_switched`); el ack hablado queda para el comando explícito. Flag
+> `LANG_AUTO_DETECT_ENABLED` para apagar sin revertir.
+
+**Enfoque A — conservador.** Se detecta idioma en (casi) todos los turnos, pero el switch
+solo ocurre cuando hay evidencia fuerte. El comando explícito de la tanda 4 **sigue ganando**
+si aparece: es más barato y no tiene falsos positivos.
+
+#### Flujo
+
+```mermaid
+flowchart TD
+    Audio["audio del turno"] --> Detect["detect_language tiny"]
+    Detect --> Policy{"politica auto"}
+    Policy -->|"switch"| Apply["apply_locale_switch auto"]
+    Policy -->|"no"| Keep["locale actual"]
+    Apply --> STT["transcribe_audio"]
+    Keep --> STT
+    STT --> Ok{"ok?"}
+    Ok -->|"sí"| Out["transcript"]
+    Ok -->|"no"| Fallback["fallback tanda4 sin re-detectar"]
+    Fallback -->|"otro idioma p>=0.75"| ApplyFB["apply_locale_switch stt-fallback"]
+    ApplyFB --> Restt["re-STT"]
+    Fallback -->|"no"| Fail["ok=False"]
+```
+
+#### Política de switch (constantes en `assistant.py`)
+
+1. `LANG_AUTO_MIN_PROB = 0.80` y audio ≥ `LANG_AUTO_MIN_AUDIO_SEC = 1.5`.
+2. Histéresis: **2** turnos seguidos en el otro idioma, **o** un turno ≥ 2.5 s con
+   `LANG_AUTO_INSTANT_PROB = 0.90`.
+3. Muletillas cortas no incrementan ni resetean la racha del otro idioma.
+4. Fallback tanda 4 (`LANG_DETECT_MIN_PROB = 0.75`) **salta** la histéresis; reutiliza el
+   detect del turno (sin segundo encode).
+5. `medium.detect_language` costaba ~2 s por el pad del encoder → detector dedicado `tiny`.
+
+Confirmaciones (`_confirm_action`) siguen con `transcribe_audio` directo: sin detect ni flip.
+
+#### Resultados medidos (audio Kokoro, GPU)
+
+| Caso | Resultado |
+| --- | --- |
+| Muletilla `vale` ~0.5 s en sesión `en` | locale sigue `en`; streak 0 |
+| 2 frases ES ≥ 1.5 s | switch en el 2º turno (`lang_switch=es`, reason=auto); chat en ES |
+| 1 frase ES larga ≥ 2.5 s, p alta | switch inmediato (auto) |
+| `"speak Spanish"` | ack hablado; limpia histéresis |
+| Camino feliz EN | `lang_detect` ~140–170 ms; sin `lang_switch`; `ttfa` chat ~950 ms |
+| STT falla + audio otro idioma | `stt-fallback` sin esperar histéresis |
+
+Nota: el roadmap estimaba 20–40 ms; con `tiny` en este hardware queda ~150 ms. Usar `medium`
+para detectar regeneraría ~2 s/turno y rompería el presupuesto de `ttfa`.
+
+#### Fuera de alcance
+
+- **Code-switching dentro de una frase**: sigue "un turno, un idioma".
+- Autodetección con `language=None` en el STT del camino feliz: sigue prohibida.
+- Más de dos idiomas: esta tanda solo arbitra `en` ↔ `es`.
+
+Depende de: tanda 4 (comando + fallback + STT multilingüe) y del holder de locale de la 3.
 
 ---
 
@@ -536,7 +616,8 @@ los `distil-*.en` aunque sean más rápidos.
 - **Voz en inglés.** Cerrado en tanda 3: `af_heart` @ 1.0.
 - **`large-v3-turbo`.** Pendiente de medir contra `medium` con beam 1.
 - **Code-switching** dentro de una misma frase (mezclar inglés y español). Whisper multilingüe lo
-  tolera, pero el TTS no: `lang` es un parámetro por llamada. Por ahora se asume una frase, un idioma.
+  tolera, pero el TTS no: `lang` es un parámetro por llamada. La tanda 5 lo deja fuera de alcance
+  a propósito: sigue valiendo "un turno, un idioma".
 - **Aritmética del 3B.** qwen2.5:3b inventa productos cortos en ambos idiomas; la tool `calc`
   (hoy apagada) es el remedio real, no el prompt.
 
