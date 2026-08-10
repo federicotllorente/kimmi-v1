@@ -13,6 +13,17 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+### Mosquitto (MQTT broker)
+
+The desktop **starts Mosquitto** when the UI bus needs MQTT (`KIMMI_UI_BUS=dual` or `mqtt`), and **stops it on exit** if Kimmi spawned it.
+
+1. Install [Mosquitto](https://mosquitto.org/download/) for Windows.
+2. Ensure `mosquitto.exe` is on `PATH`, or set `KIMMI_MOSQUITTO_BIN` to the full path
+   (e.g. `C:\Program Files\mosquitto\mosquitto.exe`).
+3. Kimmi does **not** download Mosquitto; it only launches the binary.
+
+If port `1883` is already in use, Kimmi reuses that broker and will **not** kill it on exit.
+
 ## Run
 
 Requires `engine/proj-env`, Ollama, and models ready (same as running the engine alone). The HUD uses its own `.venv` for PySide6; the voice engine still runs under `engine/proj-env`.
@@ -23,4 +34,40 @@ cd desktop
 python app.py
 ```
 
-A 200×200 window opens, starts `engine/assistant.py`, and animates the wave from pipeline status (`idle` / `listening` / `processing` / `responding`). Closing the window stops the engine.
+Startup order: **Mosquitto → MQTT client → engine subprocess**.
+
+A 200×200 window opens and animates the wave from pipeline status (`idle` / `listening` / `processing` / `responding`). A system-tray icon shows Windows toasts for `kimmi/notify` messages.
+
+Closing the window (or Quit from the tray menu) stops:
+
+1. MQTT desktop client  
+2. Engine subprocess  
+3. Mosquitto child (only if Kimmi started it)  
+4. Tray icon  
+
+### Environment variables
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `KIMMI_UI_BUS` | `dual` | `mqtt` = HUD state only from MQTT; `stdout` = legacy markers; `dual` = MQTT preferred, stdout fallback |
+| `KIMMI_MQTT_HOST` | `127.0.0.1` | Broker host |
+| `KIMMI_MQTT_PORT` | `1883` | Broker port |
+| `KIMMI_MQTT_PREFIX` | `kimmi` | Topic prefix |
+| `KIMMI_MOSQUITTO_BIN` | (PATH) | Full path to `mosquitto` if not on PATH |
+| `KIMMI_MQTT_SMOKE_NOTIFY` | unset | Set to `1` on the **engine** process to publish a toast when READY |
+
+Jobs (engine Phase B) also publish `kimmi/jobs/done` and `kimmi/jobs/failed`; the desktop shows a toast (deduped with `kimmi/notify` for the same `job_id`).
+
+Example smoke toast (engine publishes; desktop must be running):
+
+```powershell
+$env:KIMMI_MQTT_SMOKE_NOTIFY = "1"
+# then start desktop (which starts the engine with inherited env)
+python app.py
+```
+
+Or publish manually while the desktop is open:
+
+```powershell
+mosquitto_pub -h 127.0.0.1 -t kimmi/notify -m "{\"title\":\"Kimmi\",\"body\":\"Hello toast\",\"level\":\"info\"}"
+```

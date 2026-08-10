@@ -1,6 +1,7 @@
 """Registro central de tools: schemas Ollama + handlers."""
 from __future__ import annotations
 
+import json
 import os
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -18,7 +19,17 @@ from tools.read_files import read_directory_files
 from tools.remember_fact import remember_fact
 from tools.scaffold_project import TEMPLATES, scaffold_project
 from tools.search_codebase import search_codebase
+from tools.web_search import web_search
+from tools.competition_agent import start_competition_analysis
+from tools.research_agent import start_research
 from tools.write_file import write_file
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
 
 
 def build_tools(
@@ -27,10 +38,15 @@ def build_tools(
     cursor_workspace: str,
     cursor_model: str,
     cursor_api_key: Optional[str] = None,
+    enable_demo_jobs: Optional[bool] = None,
 ) -> Tuple[List[dict], Dict[str, Callable[..., str]]]:
     """Construye (tools_schema, available_tools) para Ollama function calling."""
+    from jobs import demo_long_job_worker, get_job_manager
+
     apps = ", ".join(list_allowed_app_ids())
     templates = ", ".join(TEMPLATES)
+    if enable_demo_jobs is None:
+        enable_demo_jobs = _env_flag("ENABLE_DEMO_JOBS", True)
 
     def _read(directory_path: str) -> str:
         return read_directory_files(directory_path, allowed_root=allowed_root)
@@ -127,6 +143,91 @@ def build_tools(
 
     def _remember(fact: str, category: str = "general") -> str:
         return remember_fact(fact, category=category)
+
+    def _web_search(
+        query: str,
+        max_results: int = 5,
+        language: str = "",
+    ) -> str:
+        return web_search(
+            query,
+            max_results=max_results,
+            language=language,
+            allowed_root=allowed_root,
+        )
+
+    def _demo_job(seconds: int = 30, title: str = "demo job") -> str:
+        mgr = get_job_manager()
+        job_title = (title or "demo job").strip() or "demo job"
+        try:
+            secs = int(seconds)
+        except (TypeError, ValueError):
+            secs = 30
+
+        def _fn(ctx):
+            return demo_long_job_worker(ctx, seconds=secs)
+
+        job_id = mgr.start("demo", job_title, _fn, seconds=secs)
+        return json.dumps(
+            {
+                "job_id": job_id,
+                "status": "queued",
+                "kind": "demo",
+                "title": job_title,
+                "seconds": secs,
+                "message": (
+                    "Background demo job started. Tell the user you will notify "
+                    "them when it finishes; do not invent the final summary yet."
+                ),
+            },
+            ensure_ascii=False,
+        )
+
+    def _job_status(job_id: str) -> str:
+        mgr = get_job_manager()
+        info = mgr.get(job_id)
+        if info is None:
+            # Fall back to disk read
+            disk = mgr.read_result(job_id)
+            if disk.get("error") == "not_found":
+                return json.dumps(disk, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "job_id": job_id,
+                    "status": disk.get("status"),
+                    "title": disk.get("title"),
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps(info, ensure_ascii=False)
+
+    def _job_result(job_id: str) -> str:
+        mgr = get_job_manager()
+        return json.dumps(mgr.read_result(job_id), ensure_ascii=False)
+
+    def _list_jobs(limit: int = 8) -> str:
+        mgr = get_job_manager()
+        return json.dumps(
+            {
+                "active": mgr.list_active(),
+                "recent": mgr.list_recent(limit=limit),
+            },
+            ensure_ascii=False,
+        )
+
+    def _start_research(topic: str, provider: str = "") -> str:
+        return start_research(
+            topic=topic,
+            provider=provider,
+            allowed_root=allowed_root,
+        )
+
+    def _start_competition(target: str, provider: str = "") -> str:
+        return start_competition_analysis(
+            target=target,
+            provider=provider,
+            allowed_root=allowed_root,
+        )
 
     schema: List[dict] = [
         {
@@ -409,7 +510,176 @@ def build_tools(
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": (
+                    "Search the live web via SearXNG for current facts "
+                    "(weather, news, prices, who/what is X). "
+                    "Use when the answer needs up-to-date information from the internet. "
+                    "Do NOT invent results if the tool returns an error."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query in the user's language or English.",
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Number of results (1-10, default 5).",
+                        },
+                        "language": {
+                            "type": "string",
+                            "description": "Optional SearXNG language code (e.g. en, es).",
+                        },
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_job_status",
+                "description": (
+                    "Check the status of a background job by job_id "
+                    "(queued, running, done, failed)."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "job_id": {"type": "string"},
+                    },
+                    "required": ["job_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_job_result",
+                "description": (
+                    "Read the summary/result of a finished background job. "
+                    "Use when the user asks to hear the report or after they confirm "
+                    "they want it read aloud."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "job_id": {"type": "string"},
+                    },
+                    "required": ["job_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_jobs",
+                "description": (
+                    "List active and recent background jobs (research, competition, demo, etc.). "
+                    "Use when the user asks how a research or competition job is going."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max recent jobs to include (default 8).",
+                        },
+                    },
+                    "required": [],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "start_research",
+                "description": (
+                    "Start a BACKGROUND research job on a topic (SearXNG retrieval + "
+                    "summary). REQUIRED: ask the user first whether to use local "
+                    "(Ollama), Claude, or ChatGPT, then pass provider. "
+                    "Returns job_id immediately; tell them you will notify them. "
+                    "Do NOT invent the final report."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "topic": {
+                            "type": "string",
+                            "description": "What to research.",
+                        },
+                        "provider": {
+                            "type": "string",
+                            "description": "local | claude | chatgpt (required after user chooses).",
+                        },
+                    },
+                    "required": ["topic"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "start_competition_analysis",
+                "description": (
+                    "Start a BACKGROUND competitive-analysis job for a company or product "
+                    "(SearXNG + public pages + structured brief). REQUIRED: ask the user "
+                    "first whether to use local (Ollama), Claude, or ChatGPT, then pass "
+                    "provider. Returns job_id immediately; tell them you will notify them. "
+                    "Do NOT invent the final report or pricing."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": {
+                            "type": "string",
+                            "description": "Company or product to analyze.",
+                        },
+                        "provider": {
+                            "type": "string",
+                            "description": "local | claude | chatgpt (required after user chooses).",
+                        },
+                    },
+                    "required": ["target"],
+                },
+            },
+        },
     ]
+
+    if enable_demo_jobs:
+        schema.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": "run_demo_long_job",
+                    "description": (
+                        "Start a DEMO background job that sleeps for N seconds and then "
+                        "produces a placeholder summary. Use only when the user asks to "
+                        "test a long job / demo background task. Returns immediately with "
+                        "job_id; tell them you will notify them when it finishes."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "seconds": {
+                                "type": "integer",
+                                "description": "Duration in seconds (5-120, default 30).",
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Short title for the toast/announcement.",
+                            },
+                        },
+                        "required": [],
+                    },
+                },
+            }
+        )
 
     handlers: Dict[str, Callable[..., str]] = {
         "read_directory_files": _read,
@@ -425,7 +695,15 @@ def build_tools(
         "manage_docker_container": _docker,
         "fetch_web_docs": _docs,
         "remember_fact": _remember,
+        "web_search": _web_search,
+        "get_job_status": _job_status,
+        "read_job_result": _job_result,
+        "list_jobs": _list_jobs,
+        "start_research": _start_research,
+        "start_competition_analysis": _start_competition,
     }
+    if enable_demo_jobs:
+        handlers["run_demo_long_job"] = _demo_job
 
     return schema, handlers
 
@@ -489,9 +767,29 @@ def build_system_prompt(allowed_root: str, language_name: str) -> str:
         "lab password, etc.) without asking you to save it, ask first whether they want you "
         "to remember it; do not call the tool until they say yes. "
         "If they ask about something that might be in memory, lean on the memories injected below. "
+        "NETWORK: Before relying on live information (weather, news, prices, current events), "
+        "use web_search. "
+        "If a tool returns error \"no_internet\", \"searxng_unavailable\", \"timeout\", or "
+        "\"provider_not_configured\", tell the user clearly. Do NOT invent search results, "
+        "prices, news, weather, or citations. "
+        "BACKGROUND JOBS: When a long task is started (research, competition analysis, "
+        "demo job or similar), confirm briefly that you are working on it and that you "
+        "will notify them. "
+        "Do not pretend the final report is ready. When asked to read a finished job, "
+        "use read_job_result; do not fabricate the report. "
+        "RESEARCH: For investigate/research/summarize-a-topic requests, first ask whether "
+        "to use local (Ollama + SearXNG), Claude, or ChatGPT. Then call start_research "
+        "with topic and provider. If the tool returns need_provider_choice or "
+        "provider_not_configured, tell the user and offer local. "
+        "COMPETITION: For competitors/competition/competitive-landscape requests "
+        "(analiza la competencia, competitors of X), first ask local vs Claude vs "
+        "ChatGPT, then call start_competition_analysis with target and provider. "
+        "Same need_provider_choice / provider_not_configured handling as research. "
+        "Do not invent pricing or the brief before the job finishes. "
         "TOOL DISCIPLINE: "
         "Only call a tool if the user asks for a concrete action "
-        "(open, list, write, search code, Docker, clipboard, calculation, docs, remember). "
+        "(open, list, write, search code, Docker, clipboard, calculation, docs, web search, "
+        "research, competition analysis, background job, remember). "
         "Greetings, small talk, opinions or general questions: answer WITHOUT tools. "
         "If you are unsure which tool applies or data is missing: ask, do not execute. "
         "Prefer zero tools over the wrong one. Never invent tool results. "

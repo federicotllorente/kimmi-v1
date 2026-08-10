@@ -44,6 +44,14 @@ _SPEECH_MARKERS = ("[Kimmi]:", "[Confirm]:")
 READY_MARKER = "KIMMI READY"
 
 
+def ui_bus_mode() -> str:
+    """mqtt | stdout | dual (default)."""
+    raw = (os.environ.get("KIMMI_UI_BUS") or "dual").strip().lower()
+    if raw in ("mqtt", "stdout", "dual"):
+        return raw
+    return "dual"
+
+
 def parse_engine_line(line: str) -> Optional[tuple[PipelineState, str]]:
     """Map engine stdout markers to pipeline state. Returns (state, message) or None."""
     text = line.strip()
@@ -134,6 +142,10 @@ class EngineBridge(QObject):
         self._stopping = False
         self._ready = False
         self._t0 = time.monotonic()
+        self._bus_mode = ui_bus_mode()
+        self._mqtt_connected = False
+        self._tts_active = False
+        self._use_stdout_envelope = self._bus_mode in ("dual", "stdout")
 
         # Text→speech envelope (main thread only).
         self._burst_queue: Deque[Tuple[float, float]] = deque()
@@ -155,6 +167,24 @@ class EngineBridge(QObject):
     def is_alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
+    def set_mqtt_connected(self, connected: bool) -> None:
+        self._mqtt_connected = bool(connected)
+
+    def apply_mqtt_state(self, state: str, message: str = "") -> None:
+        """HUD state from MQTT (preferred in mqtt/dual when connected)."""
+        if self._bus_mode == "stdout":
+            return
+        if self._bus_mode == "dual" and not self._mqtt_connected:
+            return
+        self._apply_state(state, message)
+
+    def apply_tts_active(self, active: bool) -> None:
+        self._tts_active = bool(active)
+        if active and self.state not in ("error", "starting") and self._ready:
+            if self.state != "responding":
+                self.state = "responding"
+                self._emit()
+
     def start(self) -> None:
         if self._running and self.is_alive:
             return
@@ -169,6 +199,8 @@ class EngineBridge(QObject):
         self._running = True
         self._ready = False
         self._t0 = time.monotonic()
+        self._bus_mode = ui_bus_mode()
+        self._use_stdout_envelope = self._bus_mode in ("dual", "stdout")
         self.state = "starting"
         self.message = "Starting engine..."
         self.amplitude = 0.0
@@ -177,6 +209,7 @@ class EngineBridge(QObject):
         self._speech_until = 0.0
         self._speech_energy = 0.0
         self._speech_gate = 0.0
+        self._tts_active = False
 
         env = os.environ.copy()
         env["PYTHONUTF8"] = "1"
@@ -234,6 +267,10 @@ class EngineBridge(QObject):
             self._reader_thread.join(timeout=2.0)
         self._reader_thread = None
 
+    def fail(self, message: str) -> None:
+        """Surface a fatal desktop/engine error on the HUD."""
+        self._fail(message)
+
     def _fail(self, message: str) -> None:
         print(f"[desktop] {message}", flush=True)
         self._running = False
@@ -255,15 +292,26 @@ class EngineBridge(QObject):
             self.message,
         )
 
+    def _stdout_drives_state(self) -> bool:
+        if self._bus_mode == "stdout":
+            return True
+        if self._bus_mode == "mqtt":
+            return False
+        # dual: stdout fallback when MQTT is down
+        return not self._mqtt_connected
+
     def _apply_state(self, state: PipelineState, message: str = "") -> None:
         if self.state == "error" and state != "error" and not self._stopping:
             if message:
                 self.message = message
             return
 
-        # Stay in starting until the engine prints ready (ignore other chatter while loading).
+        # Stay in starting until the engine is ready (ignore other chatter while loading).
         if not self._ready:
-            if state == "idle" and READY_MARKER in (message or ""):
+            ready_hint = READY_MARKER in (message or "") or (
+                state == "idle" and "READY" in (message or "").upper()
+            )
+            if state == "idle" and ready_hint:
                 self._ready = True
                 state = "idle"
             elif state == "error":
@@ -284,7 +332,7 @@ class EngineBridge(QObject):
 
     def _ingest_speech(self, text: str) -> None:
         """Queue character bursts paced like speech (main thread)."""
-        if not text:
+        if not text or not self._use_stdout_envelope:
             return
         now = time.monotonic()
         t = max(now, self._next_burst_at)
@@ -299,7 +347,7 @@ class EngineBridge(QObject):
         self._next_burst_at = t
         # Hold the gate a bit past the last scheduled burst (TTS lag after tokens).
         self._speech_until = max(self._speech_until, t + 0.45)
-        if self.state != "error":
+        if self.state != "error" and self._stdout_drives_state():
             self.state = "responding"
 
     def _watch_process(self) -> None:
@@ -325,6 +373,7 @@ class EngineBridge(QObject):
         pending = ""
         active_marker: Optional[str] = None
         ingested = 0
+        drive_state = True  # recomputed; stdout always drained
 
         try:
             while self._running:
@@ -334,32 +383,37 @@ class EngineBridge(QObject):
                 text = chunk.decode("utf-8", errors="replace")
                 print(text, end="", flush=True)
                 pending += text
+                drive_state = self._stdout_drives_state()
 
-                if active_marker is None:
-                    for marker in _SPEECH_MARKERS:
-                        if marker in pending:
-                            active_marker = marker
-                            start = pending.find(marker) + len(marker)
+                if self._use_stdout_envelope:
+                    if active_marker is None:
+                        for marker in _SPEECH_MARKERS:
+                            if marker in pending:
+                                active_marker = marker
+                                start = pending.find(marker) + len(marker)
+                                content = pending[start:]
+                                ingested = 0
+                                preview = pending.replace("\n", " ").strip()[-120:]
+                                if drive_state:
+                                    self._state_from_engine.emit("responding", preview)
+                                if content:
+                                    self._speech_text.emit(content)
+                                    ingested = len(content)
+                                break
+                    else:
+                        start = pending.find(active_marker) + len(active_marker)
+                        if start >= len(active_marker):
                             content = pending[start:]
-                            ingested = 0
-                            preview = pending.replace("\n", " ").strip()[-120:]
-                            self._state_from_engine.emit("responding", preview)
-                            if content:
-                                self._speech_text.emit(content)
+                            if len(content) > ingested:
+                                self._speech_text.emit(content[ingested:])
                                 ingested = len(content)
-                            break
-                else:
-                    start = pending.find(active_marker) + len(active_marker)
-                    if start >= len(active_marker):
-                        content = pending[start:]
-                        if len(content) > ingested:
-                            self._speech_text.emit(content[ingested:])
-                            ingested = len(content)
 
                 while "\n" in pending:
                     line, pending = pending.split("\n", 1)
                     active_marker = None
                     ingested = 0
+                    if not drive_state:
+                        continue
                     parsed = parse_engine_line(line)
                     if parsed:
                         state, message = parsed
@@ -371,10 +425,11 @@ class EngineBridge(QObject):
         finally:
             if pending.strip():
                 print(flush=True)
-                parsed = parse_engine_line(pending)
-                if parsed and self._running and not self._stopping:
-                    state, message = parsed
-                    self._state_from_engine.emit(state, message)
+                if self._stdout_drives_state():
+                    parsed = parse_engine_line(pending)
+                    if parsed and self._running and not self._stopping:
+                        state, message = parsed
+                        self._state_from_engine.emit(state, message)
 
             if self._running and not self._stopping:
                 proc = self._proc
@@ -408,7 +463,25 @@ class EngineBridge(QObject):
         # Soft decay between bursts (syllable falloff).
         self._speech_energy *= 0.88
 
-        speaking = bool(self._burst_queue) or now < self._speech_until or self._speech_energy > 0.05
+        speaking = (
+            bool(self._burst_queue)
+            or now < self._speech_until
+            or self._speech_energy > 0.05
+        )
+
+        # Synthetic pulse when MQTT drives UI and we lack stdout speech envelope.
+        if not speaking and self.state in ("responding", "listening"):
+            if self._tts_active or self.state == "responding":
+                pulse = 0.35 + 0.35 * abs(math.sin(now * 6.0))
+                self.amplitude = pulse
+                self._emit()
+                return
+            if self.state == "listening":
+                pulse = 0.12 + 0.10 * abs(math.sin(now * 2.5))
+                self.amplitude = pulse
+                self._emit()
+                return
+
         target_gate = 1.0 if speaking else 0.0
         # Asymmetric smoothing: faster attack, slower release (no hard cuts).
         if target_gate > self._speech_gate:

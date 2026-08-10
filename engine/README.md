@@ -93,6 +93,62 @@ Para salir: `Ctrl+C`.
 | `KIMMI_VSCODE_PATH` / `KIMMI_CURSOR_PATH` / `KIMMI_BROWSER_PATH` / `KIMMI_TERMINAL_PATH` | Rutas a ejecutables si no están en el PATH |
 | `KIMMI_BROWSER_PROFILE_WORK` | Directorio de perfil del navegador para `profile=work` |
 | `KIMMI_WORKSPACE_ASSISTANT` | Sobrescribe el alias de workspace `assistant` |
+| `KIMMI_MQTT_HOST` / `KIMMI_MQTT_PORT` / `KIMMI_MQTT_PREFIX` | Bus MQTT (`127.0.0.1:1883`, prefijo `kimmi`) — estados del pipeline y notificaciones |
+| `KIMMI_MQTT_SMOKE_NOTIFY` | `1` = publicar un toast de prueba al llegar a READY |
+| `KIMMI_UI_BUS` | Usado por el **desktop**: `dual` (default) / `mqtt` / `stdout` |
+| `KIMMI_SEARXNG_URL` | SearXNG base URL (default `http://127.0.0.1:8080`) |
+| `ENABLE_DEMO_JOBS` | `1`/`0` — tool `run_demo_long_job` (default on in code) |
+| `KIMMI_RESEARCH_MODEL` | Ollama model for research / competition synthesis |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | Cloud synthesis for research / competition |
+
+### MQTT (Fase A)
+
+El desktop puede levantar Mosquitto y suscribirse a:
+
+- `kimmi/pipeline/state` — HUD (`starting` / `idle` / `listening` / `processing` / `responding` / `error`)
+- `kimmi/notify` — toast de Windows
+- `kimmi/tts/active` — refuerzo de animación
+- `kimmi/jobs/done` / `kimmi/jobs/failed` — toast de jobs (dedupe con notify)
+
+El engine publica esos topics desde [`mqtt_bus.py`](mqtt_bus.py). Al cerrar el desktop se desconecta MQTT, se mata el engine y, si Kimmi spawneó Mosquitto, también el broker. Detalles en [`../desktop/README.md`](../desktop/README.md).
+
+### Web search y jobs (Fase B)
+
+1. Instala y arranca [SearXNG](https://docs.searxng.org/) en local (JSON API habilitada), p.ej. en `http://127.0.0.1:8080`.
+2. Con `ENABLE_TOOLS = True` (por defecto tras Fase B), puedes pedir: *“busca el clima de mañana”* → tool `web_search`.
+3. Sin internet la tool devuelve `{"error":"no_internet"}` y Kimmi lo dice; **no inventa** resultados.
+4. Sin SearXNG: `searxng_unavailable`.
+5. Demo de job largo: *“corre un job demo de treinta segundos”* → `run_demo_long_job` → toast + “¿te leo el resumen?”.
+
+### Research agent (Fase C)
+
+1. *“Investiga sobre X y haz un resumen”* → Kimmi pregunta **local / Claude / ChatGPT**.
+2. `start_research(topic, provider)` encola un job: SearXNG + fetch de páginas públicas + síntesis.
+   - `local` → Ollama (`KIMMI_RESEARCH_MODEL` o `qwen2.5:14b`)
+   - `claude` → requiere `ANTHROPIC_API_KEY`
+   - `chatgpt` → requiere `OPENAI_API_KEY`
+3. Retrieval **siempre** pasa por SearXNG (las APIs cloud solo sintetizan).
+4. Solo se fetchean URLs públicas (se bloquean IPs privadas/loopback).
+5. Al terminar: toast + “¿te leo el resumen?” (mismo loop de jobs de Fase B).
+
+| Variable | Uso |
+|----------|-----|
+| `KIMMI_RESEARCH_MODEL` | Modelo Ollama para síntesis local |
+| `KIMMI_CLAUDE_MODEL` | Override modelo Anthropic |
+| `KIMMI_CHATGPT_MODEL` | Override modelo OpenAI |
+| `ANTHROPIC_API_KEY` | Claude |
+| `OPENAI_API_KEY` | ChatGPT |
+
+### Análisis de competencia (Fase D)
+
+1. *“Analizame la competencia de X”* → Kimmi pregunta **local / Claude / ChatGPT** (mismo contrato que research).
+2. `start_competition_analysis(target, provider)` encola un job de varios minutos:
+   - hasta 5 queries SearXNG, hasta 10 URLs públicas con `web_fetch`, delay ~0.5s entre requests
+   - User-Agent de fetch: `KimmiResearchBot` (mismo que research)
+   - síntesis con brief estructurado (jugadores, value props, pricing solo si aparece en fuentes, incertidumbre marcada)
+3. Fallos parciales de fetch se anotan en `sources.json` y el job sigue; sin fuentes usables → error claro.
+4. Mismas env keys que Fase C (`KIMMI_RESEARCH_MODEL`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`).
+5. Al terminar: toast + “¿te leo?”; no inventa el informe ni precios antes de tiempo.
 
 En [`assistant.py`](assistant.py) puedes ajustar:
 

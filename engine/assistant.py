@@ -34,6 +34,9 @@ from locale_config import (
     match_language_switch,
     set_locale,
 )
+from mqtt_bus import bus as mqtt_bus
+from jobs import JobManager, peek_announcement_count, pop_announcement
+import jobs as jobs_mod
 from tools.app_allowlist import list_allowed_app_ids
 from tools.intent import (
     INTENT_CONFIDENCE_THRESHOLD,
@@ -133,7 +136,8 @@ USER_NAME = "Fede"
 
 # Feature flags
 ENABLE_INTENT_ROUTER = False  # Clasificar intent antes de responder (añade latencia)
-ENABLE_TOOLS = False  # Function calling / acciones locales
+ENABLE_TOOLS = True  # Function calling / acciones locales (web_search, jobs, …)
+ENABLE_DEMO_JOBS = True  # run_demo_long_job for Phase B validation
 
 # Relleno hablado cuando el turno se va de tiempo. El umbral se mide desde el
 # corte del VAD, no desde el LLM: hoy un turno normal empieza a sonar entre 830
@@ -243,12 +247,14 @@ else:
     print(f"Using Piper TTS ({current_locale().piper_model})...")
 
 # --- TOOLS (FUNCTION CALLING) ---
+jobs_mod.job_manager = JobManager(ALLOWED_DATA_ROOT)
 tools_schema, available_tools = build_tools(
     allowed_root=ALLOWED_DATA_ROOT,
     llm_model=LLM_MODEL,
     cursor_workspace=CURSOR_WORKSPACE,
     cursor_model=CURSOR_MODEL,
     cursor_api_key=os.environ.get("CURSOR_API_KEY"),
+    enable_demo_jobs=ENABLE_DEMO_JOBS,
 )
 
 # --- INICIALIZACIÓN DE COMPONENTES ---
@@ -791,15 +797,25 @@ def _enqueue_filler(phrase: str) -> bool:
     Silencio deliberado: desktop/bridge.py ingiere caracteres tras [Kimmi]:
     hasta el primer salto de línea, y stream_ollama_to_tts ya dejó esa línea
     abierta. Un print desde aquí congelaría la onda el resto de la respuesta.
+
+    Solo miramos audio *pendiente* del turno actual: ``has_emitted_audio``
+    sigue True tras turnos previos hasta el próximo ``begin_turn``, y bloquear
+    por eso dejaba el camino de tools en silencio ~decenas de segundos.
     """
     if not FILLER_ENABLED or _filler_played.is_set():
         return False
-    # Si ya suena o hay algo encolado, el relleno caería por detrás de la voz.
-    if audio_sink.has_emitted_audio() or audio_sink.pending_seconds() > 0:
+    # Si aún hay cola de reproducción, el relleno caería detrás de la voz.
+    if audio_sink.pending_seconds() > 0:
         return False
     clip = clip_cache_for(current_locale()).get(phrase)
     if clip is None:
-        return False
+        # Caché fría / idioma recién cambiado: sintetizar en vivo una vez.
+        try:
+            clip = _synthesize_chunk(phrase.strip(), True)
+        except Exception:  # noqa: BLE001
+            clip = None
+        if clip is None or getattr(clip, "size", 0) == 0:
+            return False
     _filler_played.set()
     audio_sink.enqueue(clip, notify=False)
     perf.mark("filler")
@@ -822,6 +838,21 @@ def arm_filler() -> Optional[threading.Timer]:
     return timer
 
 
+def publish_pipeline(state: str, message: str = "") -> None:
+    """Publish HUD pipeline state over MQTT (no-op if bus is down)."""
+    try:
+        mqtt_bus.publish_state(state, message)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[MQTT]: publish_state failed ({exc})", flush=True)
+
+
+def publish_tts(active: bool) -> None:
+    try:
+        mqtt_bus.publish_tts_active(active)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[MQTT]: publish_tts_active failed ({exc})", flush=True)
+
+
 def speak_text(text: str, allow_barge_in: bool = True) -> bool:
     """Reproduce texto por TTS (bloqueante hasta que termina el audio).
 
@@ -832,14 +863,19 @@ def speak_text(text: str, allow_barge_in: bool = True) -> bool:
         return False
 
     print(f"[Kimmi]: {text}")
+    publish_pipeline("responding", text[:120])
+    publish_tts(True)
     speech.begin_turn(allow_barge_in=allow_barge_in and BARGE_IN_ENABLED)
     # Las frases fijas salen del caché: es un memcpy en vez de ~250 ms de Kokoro.
-    clip = clip_cache_for(current_locale()).get(text)
-    if clip is not None:
-        speech.play_clip(clip, notify=True)
-    else:
-        speech.feed(text.strip())
-    barged = speech.end_turn()
+    try:
+        clip = clip_cache_for(current_locale()).get(text)
+        if clip is not None:
+            speech.play_clip(clip, notify=True)
+        else:
+            speech.feed(text.strip())
+        barged = speech.end_turn()
+    finally:
+        publish_tts(False)
     # Tras hablar, el mic capta el eco → no aceptar wake word un momento.
     suppress_wake_word(WAKE_COOLDOWN_SEC)
     return barged
@@ -886,11 +922,140 @@ def is_conversation_closing(text: str) -> bool:
     )
 
 
+# Verbos / dominio que suelen requerir tools. Conservador: si aparece, no
+# saltamos al modelo rápido sin tools.
+_TOOLISH_RE = re.compile(
+    r"(?i)\b("
+    r"open|launch|search|research|investigat\w*|compet\w*|analy[sz]\w*"
+    r"|remember|docker|clipboard|calculat\w*|compute|write|list|fetch|job"
+    r"|weather|news|price|browser|terminal|folder|file|code|scaffold"
+    r"|summary|status|result|read\s+(?:it|that|the)|tell\s+me\s+what"
+    r"|busca\w*|abre|investiga\w*|competencia|analiza\w*|recuerda\w*"
+    r"|escribe|lista|calcula\w*|portapapeles|documentaci[oó]n|clima"
+    r"|archivo|carpeta|navegador|contenedor|rese[nñ]a"
+    r"|resumen|estado\s+del\s+job|le[eé]\w*"
+    r"|local|claude|chatgpt|ollama"
+    r")\b"
+)
+
+_PROVIDER_FOLLOWUP_RE = re.compile(
+    r"(?i)("
+    r"\blocal\b|\bclaude\b|\bchatgpt\b|\bollama\b|\bprovider\b"
+    r"|\banthropic\b|\bopenai\b"
+    r"|quieres?\s+que\s+lo\s+recuerde"
+    r"|want\s+me\s+to\s+remember"
+    r"|should\s+i\s+remember"
+    r")",
+)
+
+
+def _history_expects_tool_followup(history: List[Dict[str, Any]]) -> bool:
+    """True si el último mensaje de Kimmi espera provider / confirmación de tool."""
+    for msg in reversed(history or []):
+        if msg.get("role") != "assistant":
+            continue
+        content = str(msg.get("content") or "")
+        return bool(_PROVIDER_FOLLOWUP_RE.search(content))
+    return False
+
+
+def looks_like_chat_only(
+    text: str,
+    history: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    """Heurística ligera: charla sin acción → no pagar el 14B+tools.
+
+    No sustituye al intent router; solo evita el camino pesado cuando el
+    enunciado es claramente social / ack y el historial no espera un follow-up
+    de tool (p.ej. elección local/Claude/ChatGPT).
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return False
+    if _history_expects_tool_followup(history or []):
+        return False
+    if _TOOLISH_RE.search(cleaned):
+        return False
+
+    loc = current_locale()
+    normalized = cleaned.lower().strip()
+    normalized = re.sub(r"^[¿¡\s]+", "", normalized)
+    normalized = re.sub(r"[\s\.\!\?\,;:]+$", "", normalized)
+
+    if loc.rag_skip_re.match(cleaned) or loc.rag_skip_re.match(normalized):
+        return True
+
+    # Frases cortas sin verbo de acción: small talk / ack residual.
+    if len(normalized) <= 48 and not _TOOLISH_RE.search(normalized):
+        # Evitar mandar pedidos ambiguos cortos ("hazlo", "ahora") al chat-only.
+        if re.search(r"(?i)\b(hazlo|do\s+it|go\s+ahead|now|ahora|ya)\b", normalized):
+            return False
+        return True
+    return False
+
+
 def speak_closing_ack() -> str:
     """Cierre breve; no pregunta si necesita algo más."""
     ack = random.choice(current_locale().closing_ack)
     speak_text(ack, allow_barge_in=False)
     return ack
+
+
+JOB_SUMMARY_SPEAK_CHARS = 1000
+
+
+def drain_job_announcements(mic_stream) -> None:
+    """Speak job-done prompts from the background queue (idle or between turns)."""
+    if peek_announcement_count() <= 0:
+        return
+
+    ann = pop_announcement()
+    if ann is None:
+        return
+
+    loc = current_locale()
+    title = ann.title or ann.kind or "the job"
+    if ann.ok:
+        prompt = loc.spoken["job_done_ask_read"].format(title=title)
+    else:
+        prompt = loc.spoken["job_failed_ask"].format(title=title)
+
+    print(f"[Jobs]: announce {ann.job_id} ok={ann.ok}")
+    suppress_wake_word(2.0)
+    speak_text(prompt, allow_barge_in=False)
+
+    audio_bytes = record_user_audio_vad(
+        mic_stream,
+        max_wait_for_speech_sec=8.0,
+    )
+    if not audio_bytes:
+        speak_text(loc.spoken["job_read_declined"], allow_barge_in=False)
+        return
+
+    transcript, ok = transcribe_audio(audio_bytes)
+    print(f"[Jobs]: confirm {transcript!r} (ok={ok})")
+    decision = parse_yes_no(transcript) if ok else None
+    if decision is not True:
+        speak_text(loc.spoken["job_read_declined"], allow_barge_in=False)
+        return
+
+    mgr = jobs_mod.get_job_manager()
+    payload = mgr.read_result(ann.job_id)
+    summary = (payload.get("summary") or "").strip()
+    if not summary and payload.get("error"):
+        summary = str(payload.get("message") or payload.get("error") or "")
+    if not summary:
+        speak_text(loc.spoken["job_no_result"], allow_barge_in=False)
+        return
+
+    spoken = summary
+    more = False
+    if len(spoken) > JOB_SUMMARY_SPEAK_CHARS:
+        spoken = spoken[:JOB_SUMMARY_SPEAK_CHARS].rsplit(" ", 1)[0] + "…"
+        more = True
+    speak_text(spoken, allow_barge_in=True)
+    if more:
+        speak_text(loc.spoken["job_summary_more"], allow_barge_in=False)
 
 
 # --- CAPTURA Y TRANCRIPCIÓN ---
@@ -1213,6 +1378,8 @@ def _confirm_action(stream, fn_name: str, fn_args: dict) -> bool:
 
 
 def _chat_reply(messages: List[Dict[str, Any]], model: str) -> str:
+    publish_pipeline("responding", "LLM reply")
+    publish_tts(True)
     speech.begin_turn(allow_barge_in=BARGE_IN_ENABLED)
     filler_timer = arm_filler()
     try:
@@ -1221,6 +1388,7 @@ def _chat_reply(messages: List[Dict[str, Any]], model: str) -> str:
         if filler_timer is not None:
             filler_timer.cancel()
         speech.end_turn()
+        publish_tts(False)
         suppress_wake_word(WAKE_COOLDOWN_SEC)
     return final or current_locale().spoken["done"]
 
@@ -1235,12 +1403,21 @@ def _run_tools_turn(
     # El 14B va sin stream y solo habla al terminar: aquí ya sabemos que va a
     # tardar, así que el aviso es inmediato y no espera al timer.
     _enqueue_filler(current_locale().filler_tools)
-    response = ollama.chat(
-        model=LLM_MODEL,
-        messages=messages,
-        tools=tools,
-        keep_alive="24h",
-    )
+    # Si el clip falló (caché fría), el timer de chat cubre el hueco cuando
+    # haya respuesta directa; mientras tanto rearmamos un timer corto.
+    filler_timer = None
+    if not _filler_played.is_set():
+        filler_timer = arm_filler()
+    try:
+        response = ollama.chat(
+            model=LLM_MODEL,
+            messages=messages,
+            tools=tools,
+            keep_alive="24h",
+        )
+    finally:
+        if filler_timer is not None:
+            filler_timer.cancel()
 
     tool_calls = response["message"].get("tool_calls") or []
     if not tool_calls:
@@ -1274,6 +1451,7 @@ def _run_tools_turn(
             return current_locale().spoken["cancelled"]
 
     print(f"\n[Running]: {fn_name}")
+    publish_pipeline("processing", f"tool {fn_name}")
     try:
         tool_result = available_tools[fn_name](**fn_args)
     except TypeError as exc:
@@ -1353,6 +1531,10 @@ def handle_user_turn(
             if force_memory:
                 subset = tools_for_intent("memory", tools_schema)
                 return _run_tools_turn(messages, subset or tools_schema, mic_stream)
+            # Charla clara → 3B sin tools (evita ~50s del 14B "with tools").
+            if looks_like_chat_only(effective_user_text, history):
+                print("  [LLM]: chat-only heuristic → fast model, no tools")
+                return _chat_reply(messages, FAST_MODEL)
             return _run_tools_turn(messages, tools_schema, mic_stream)
         return _chat_reply(messages, FAST_MODEL)
 
@@ -1434,7 +1616,10 @@ def run_conversation_session(
             else:
                 if not first_turn:
                     print("\n=== Listening (active session) ===")
+                    publish_pipeline("listening", "active session")
                     _prepare_listen(mic_stream)
+                else:
+                    publish_pipeline("listening", "recording")
 
                 user_audio_bytes = record_user_audio_vad(
                     mic_stream,
@@ -1450,6 +1635,7 @@ def run_conversation_session(
 
             # El turno arranca cuando el usuario deja de hablar: todo lo que venga
             # después es latencia que él percibe.
+            publish_pipeline("processing", "stt")
             perf.start_turn()
             play_earcon()
             with perf.span("stt"):
@@ -1516,6 +1702,9 @@ def run_conversation_session(
 
             if not CONVERSATION_MODE:
                 break
+
+            # Background jobs may have finished while we were talking.
+            drain_job_announcements(mic_stream)
     finally:
         # Don't carry a half-built streak into the next wake session.
         reset_auto_lang_state()
@@ -1617,6 +1806,9 @@ def warmup() -> None:
 
 
 def main():
+    mqtt_bus.start()
+    publish_pipeline("starting", "engine boot")
+
     mic_stream = audio.open(
         format=FORMAT,
         channels=CHANNELS,
@@ -1634,12 +1826,20 @@ def main():
     wake_ring: deque = deque(maxlen=ring_maxlen)
 
     print("\n=== KIMMI READY ===")
+    publish_pipeline("idle", "KIMMI READY")
+    if os.environ.get("KIMMI_MQTT_SMOKE_NOTIFY", "").strip() in ("1", "true", "yes"):
+        mqtt_bus.publish_notify(
+            "Kimmi",
+            "MQTT notify smoke test — engine is ready.",
+            level="info",
+        )
     print(
         f"Fast: {FAST_MODEL} | Heavy: {LLM_MODEL} | User: {USER_NAME}"
     )
     print(
         f"Flags: INTENT_ROUTER={ENABLE_INTENT_ROUTER} | TOOLS={ENABLE_TOOLS} | "
-        f"TTS={TTS_ENGINE} | CONVERSATION={CONVERSATION_MODE} | BARGE_IN={BARGE_IN_ENABLED}"
+        f"DEMO_JOBS={ENABLE_DEMO_JOBS} | TTS={TTS_ENGINE} | "
+        f"CONVERSATION={CONVERSATION_MODE} | BARGE_IN={BARGE_IN_ENABLED}"
     )
 
     try:
@@ -1657,6 +1857,7 @@ def main():
 
             if any(score >= WAKE_WORD_THRESHOLD for score in scores):
                 print("\n[Wake Detected!]")
+                publish_pipeline("listening", "Wake Detected")
                 initial_audio, strip_wake = capture_after_wake_word(
                     mic_stream, wake_ring
                 )
@@ -1675,16 +1876,27 @@ def main():
                 suppress_wake_word(WAKE_COOLDOWN_SEC)
                 wake_ring.clear()
                 print("\n=== KIMMI IDLE ===")
+                publish_pipeline("idle", "KIMMI IDLE")
+                drain_job_announcements(mic_stream)
+
+            # Idle: announce finished jobs without requiring a wake word.
+            elif peek_announcement_count() > 0 and not wake_word_suppressed():
+                drain_job_announcements(mic_stream)
+                suppress_wake_word(WAKE_COOLDOWN_SEC)
+                publish_pipeline("idle", "KIMMI IDLE")
 
     except KeyboardInterrupt:
         print("\nShutting down Kimmi...")
     finally:
+        if jobs_mod.job_manager is not None:
+            jobs_mod.job_manager.shutdown(wait=False)
         speech.close()
         barge_in_monitor.close()
         audio_sink.close()
         mic_stream.stop_stream()
         mic_stream.close()
         audio.terminate()
+        mqtt_bus.stop()
 
 
 if __name__ == "__main__":

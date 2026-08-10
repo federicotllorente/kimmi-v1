@@ -125,6 +125,15 @@ EN = Locale(
         ),
         "language_switched": "Alright, switching to English.",
         "language_already": "I'm already in English.",
+        "job_done_ask_read": (
+            "I finished {title}. Want me to read the summary?"
+        ),
+        "job_failed_ask": (
+            "The job {title} failed. Want me to tell you what went wrong?"
+        ),
+        "job_read_declined": "Okay. Ask me anytime if you want the summary.",
+        "job_no_result": "I don't have a summary for that job.",
+        "job_summary_more": "That's the short version. Ask if you want more detail.",
     },
     confirm={
         "launch_app_path": "I'm going to open {app} in {path}. Confirm?",
@@ -166,6 +175,8 @@ EN = Locale(
         r"|i\s+don'?t\s+need\s+anything(?:\s+else)?(?:\s+(?:right\s+)?now)?"
         r"|good\s?bye|bye(?:\s+bye)?|see\s+(?:you|ya)(?:\s+later)?|later"
         r"|cool|great|perfect|ok(?:ay)?|got\s+it|sounds\s+good"
+        r"|no\s+worries|no\s+problem|no\s+big\s+deal|don'?t\s+worry"
+        r"|it'?s\s+(?:fine|okay|ok|all\s+good)|never\s+mind"
         r")[\s\.\!\,]*$",
     ),
     closing_soft_re=re.compile(
@@ -180,6 +191,10 @@ EN = Locale(
         r"|\bwe(?:'re|\s+are)\s+done\b"
         r"|\bsee\s+(?:you|ya)(?:\s+later)?\b"
         r"|\bgood\s?bye\b"
+        r"|\bno\s+worries\b"
+        r"|\bno\s+problem\b"
+        r"|\bno\s+big\s+deal\b"
+        r"|\bdon'?t\s+worry\b"
         r")",
     ),
     closing_starters=(
@@ -203,6 +218,16 @@ EN = Locale(
         "were done",
         "i don't need anything else",
         "i dont need anything else",
+        "no worries",
+        "no problem",
+        "no big deal",
+        "don't worry",
+        "dont worry",
+        "never mind",
+        "okay, no worries",
+        "ok, no worries",
+        "okay no worries",
+        "ok no worries",
     ),
     yes_re=re.compile(
         r"\b(yes|yeah|yep|yup|sure|ok|okay|confirm|confirmed|affirmative"
@@ -299,6 +324,15 @@ ES = Locale(
         ),
         "language_switched": "Vale, hablamos en español.",
         "language_already": "Ya estoy en español.",
+        "job_done_ask_read": (
+            "Ya terminé {title}. ¿Querés que te lea el resumen?"
+        ),
+        "job_failed_ask": (
+            "El trabajo {title} falló. ¿Querés que te diga qué pasó?"
+        ),
+        "job_read_declined": "Vale. Cuando quieras, pedime el resumen.",
+        "job_no_result": "No tengo un resumen para ese trabajo.",
+        "job_summary_more": "Eso es lo corto. Pedime más detalle si querés.",
     },
     confirm={
         "launch_app_path": "Voy a abrir {app} en {path}. ¿Confirmas?",
@@ -345,6 +379,12 @@ ES = Locale(
         r"|bye"
         r"|cuando\s+quiera(?:s)?"
         r"|no\s+por\s+ahora"
+        r"|no\s+(?:hay\s+)?problema"
+        r"|no\s+pasa\s+nada"
+        r"|no\s+te\s+preocupes"
+        r"|sin\s+problema"
+        r"|tranquil[oa]"
+        r"|dale\s+igual"
         r")[\s\.\!\,]*$",
     ),
     closing_soft_re=re.compile(
@@ -359,6 +399,10 @@ ES = Locale(
         r"|\bya\s+est[aá]\b"
         r"|\bhasta\s+luego\b"
         r"|\badi[oó]s\b"
+        r"|\bno\s+(?:hay\s+)?problema\b"
+        r"|\bno\s+pasa\s+nada\b"
+        r"|\bno\s+te\s+preocupes\b"
+        r"|\bsin\s+problema\b"
         r")",
     ),
     closing_starters=(
@@ -380,6 +424,12 @@ ES = Locale(
         "no necesito nada mas",
         "estoy bien",
         "ahora estoy bien",
+        "no hay problema",
+        "no pasa nada",
+        "no te preocupes",
+        "sin problema",
+        "tranquilo",
+        "tranquila",
     ),
     yes_re=re.compile(
         r"\b(s[ií]|dale|ok|okay|vale|confirmo|confirma|afirmativo|adelante|hazlo|claro)\b",

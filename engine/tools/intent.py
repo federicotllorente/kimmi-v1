@@ -21,6 +21,20 @@ INTENT_TOOL_MAP: Dict[str, List[str]] = {
     "clipboard": ["manage_clipboard"],
     "calc": ["exec_python_repl"],
     "docs": ["fetch_web_docs"],
+    "web": ["web_search"],
+    "jobs": ["run_demo_long_job", "get_job_status", "read_job_result", "list_jobs"],
+    "research": [
+        "start_research",
+        "get_job_status",
+        "read_job_result",
+        "list_jobs",
+    ],
+    "competition": [
+        "start_competition_analysis",
+        "get_job_status",
+        "read_job_result",
+        "list_jobs",
+    ],
     "memory": ["remember_fact"],
 }
 
@@ -52,7 +66,7 @@ _CLASSIFY_SYSTEM = (
     "You are an intent classifier for a voice assistant named Kimmi. "
     "Reply ONLY with valid JSON, no markdown and no extra text. "
     "Schema: {\"intent\": string, \"confidence\": number, \"brief_reason\": string}. "
-    "intent must be exactly one of: chat, apps, files, code, docker, clipboard, calc, docs, memory, clarify. "
+    "intent must be exactly one of: chat, apps, files, code, docker, clipboard, calc, docs, web, jobs, research, competition, memory, clarify. "
     "Rules: "
     "chat = greeting, small talk, general question with no action on the PC "
     "(including asking about something that should already be in memory, without asking to save it); "
@@ -62,7 +76,13 @@ _CLASSIFY_SYSTEM = (
     "docker = containers or compose; "
     "clipboard = the clipboard; "
     "calc = calculations or numeric conversions; "
-    "docs = web documentation; "
+    "docs = allowlisted library/API documentation pages; "
+    "web = live web search for current facts (weather, news, prices, who/what); "
+    "jobs = start/check/read a demo or generic background job; "
+    "research = investigate or research a topic in depth and produce a summary "
+    "(including choosing local vs Claude/ChatGPT); "
+    "competition = analyze competitors / competition / competitive landscape for a company or product "
+    "(including choosing local vs Claude/ChatGPT); "
     "memory = the user EXPLICITLY asks to remember, note down or save something to memory "
     "(remember that..., note..., save that...); "
     "clarify = the audio is ambiguous, incomplete or unintelligible. "
