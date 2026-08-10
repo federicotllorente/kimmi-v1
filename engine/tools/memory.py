@@ -15,6 +15,8 @@ from typing import Any, List, Optional
 import chromadb
 import ollama
 
+from locale_config import current_locale
+
 _ENGINE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_DB_PATH = os.path.join(_ENGINE_DIR, "memory")
 DEFAULT_EMBED_MODEL = "nomic-embed-text"
@@ -29,12 +31,8 @@ EMBED_KEEP_ALIVE = "24h"
 QUERY_CACHE_SIZE = 32
 
 # Un embedding por turno es caro. Saludos y muletillas nunca aportan contexto.
+# El patrón por idioma vive en el locale como rag_skip_re.
 _SKIP_QUERY_MIN_CHARS = 8
-_SKIP_QUERY_RE = re.compile(
-    r"(?i)^\s*(?:hola|buenas|hey|qu[eé]\s+tal|c[oó]mo\s+est[aá]s|buenos\s+d[ií]as"
-    r"|buenas\s+tardes|buenas\s+noches|s[ií]|no|vale|ok(?:ay)?|dale|gracias)"
-    r"[\s\.\!\?\,]*$"
-)
 
 
 class KimmiMemory:
@@ -137,7 +135,9 @@ class KimmiMemory:
             return ""
 
         # Gate barato antes de pagar el embedding.
-        if len(query) < _SKIP_QUERY_MIN_CHARS or _SKIP_QUERY_RE.match(query):
+        if len(query) < _SKIP_QUERY_MIN_CHARS:
+            return ""
+        if current_locale().rag_skip_re.match(query):
             return ""
 
         count = self._cached_count()
@@ -158,7 +158,7 @@ class KimmiMemory:
                 include=["documents", "distances", "metadatas"],
             )
         except Exception as exc:  # noqa: BLE001
-            print(f"  [Memoria]: error en búsqueda RAG: {exc}")
+            print(f"  [Memory]: RAG search failed: {exc}")
             return ""
 
         documents = (results.get("documents") or [[]])[0]

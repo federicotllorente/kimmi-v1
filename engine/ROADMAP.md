@@ -4,23 +4,22 @@
 > plan por tandas. Sirve como entrada para redactar los planes de las tandas 2, 3 y 4
 > sin tener que volver a analizar el código desde cero.
 >
-> Última actualización: 2026-08-07
+> Última actualización: 2026-08-10
 
 ---
 
 ## 1. Objetivo
 
-Kimmi es un asistente de voz local (estilo Jarvis) que hoy funciona **solo en español**.
-Lo que queremos:
+Kimmi es un asistente de voz local (estilo Jarvis). Desde la tanda 3 soporta **inglés
+(default)** y **español** (`KIMMI_LANG`). Lo que queremos:
 
 1. **Soportar inglés y español**, con **inglés como idioma por defecto**.
 2. Que suene **lo más natural posible** en ambos idiomas.
 3. Que **responda lo más rápido posible**, y cuando no pueda, que **dé señal de vida
    mientras piensa** para que el usuario sienta que fue escuchado.
 
-Conclusión del análisis: el idioma y la latencia son problemas **independientes**. La
-latencia actual no viene del español, viene del pipeline de audio. Por eso el trabajo se
-ordena en tandas donde la latencia va primero.
+Conclusión del análisis: el idioma y la latencia son problemas **independientes**. Las
+tandas 1–2 atacaron la latencia; la 3 el idioma; la 4 el cambio en caliente.
 
 ---
 
@@ -290,18 +289,16 @@ Referencia rápida para no volver a comprobarlo:
 [`../desktop/bridge.py`](../desktop/bridge.py) clasifican el estado del pipeline haciendo **match
 de texto** sobre el stdout del motor. Restricciones:
 
-- Literales que hoy se parsean: `KIMMI EN ESPERA`, `Volviendo a estado de espera`,
-  `[Wake Word Detectado`, `[VAD]:`, `[Tú]:`, `[Intent]:`, `[LLM]:`, `[Tools]:`, `[Cierre]:`,
-  `[Sesión]:`, `[Memoria]:`, `[RAG Memoria]:`, `[Kimmi]:`, `[Confirmación]:`,
-  `Escuchando (sesión activa)`, `Usando audio del barge-in`, `Kimmi ejecutando`.
-- `desktop/bridge.py` define `_SPEECH_MARKERS = ("[Kimmi]:", "[Confirmación]:")` y va ingiriendo
+- Literales que se parsean **hoy** (tanda 3, neutros): `KIMMI READY`, `KIMMI IDLE`,
+  `[Wake Detected`, `[VAD]:`, `[You]:`, `[Intent]:`, `[LLM]:`, `[Tools]:`, `[Closing]:`,
+  `[Session]:`, `[Memory]:`, `[RAG]:`, `[Kimmi]:`, `[Confirm]:`,
+  `Listening (active session)`, `Using barge-in audio`, `[Running]:`.
+- `desktop/bridge.py` define `_SPEECH_MARKERS = ("[Kimmi]:", "[Confirm]:")` y va ingiriendo
   **carácter a carácter** todo lo que se imprime después del marker para animar la onda. Por eso
   `stream_ollama_to_tts` debe seguir imprimiendo los deltas de tokens de forma incremental con
   `flush=True`, aunque cambie por dentro.
-- Las líneas de métricas nuevas usan prefijo `[perf]`, que no matchea ningún marker de ninguno de
+- Las líneas de métricas usan prefijo `[perf]`, que no matchea ningún marker de ninguno de
   los dos bridges: son inertes.
-- **Cuando llegue la tanda 3** hay que sustituir estos markers en español por markers neutros
-  (idealmente una línea JSON tipo `{"state":"listening"}`) y adaptar los dos bridges en el mismo commit.
 
 ---
 
@@ -453,46 +450,64 @@ Earcon (90 ms, pico 0.12, bordes exactamente a 0): score de wake word **0.0009**
 de 0.5, y 0 de 2 chunks marcados como voz por el VAD de barge-in, que además pide 400 ms seguidos.
 No dispara ninguno de los dos.
 
-### Tanda 3 — Internacionalización
+### Tanda 3 — Internacionalización (implementada)
 
-Nuevo `engine/locale_config.py` con un dataclass congelado y un holder mutable
-(`current_locale()` / `set_locale(code)`), porque el cambio debe poder ocurrir a mitad de sesión:
+> **Estado: hecha.** Inglés es el default (`KIMMI_LANG`, fallback `en`). Español se activa con
+> `KIMMI_LANG=es`. Todo lo hablado y las regexes viven en `engine/locale_config.py` y se leen por
+> llamada vía `current_locale()` / `set_locale()` (listo para la tanda 4).
 
-```python
-@dataclass(frozen=True)
-class Locale:
-    code: str                    # "en" | "es"
-    language_name: str           # "English" -> se inyecta en el system prompt
-    whisper_language: str
-    stt_initial_prompt: str
-    tts_lang: str                # "en-us" | "es"
-    tts_voice: str               # "af_heart" | "ef_dora"
-    tts_speed: float
-    wake_ack_phrases: tuple[str, ...]
-    closing_ack_phrases: tuple[str, ...]
-    filler_phrases: tuple[str, ...]
-    closing_re: re.Pattern
-    closing_soft_re: re.Pattern
-    wake_phrase_re: re.Pattern
-    yes_re: re.Pattern
-    no_re: re.Pattern
-    ui: dict[str, str]           # mensajes cortos hablados
-    confirm: dict[str, str]      # plantillas de confirmacion
-```
+Diseño original (resumen): un `Locale` congelado por idioma, un solo system prompt en inglés con
+`Always reply in {language_name}.`, schemas de tools en inglés fijo, markers de stdout neutros
+compartidos por los dos bridges, y un clip cache por locale.
 
-Tareas:
+#### Decisiones al implementar
 
-- Extraer todo lo del inventario 3.1 al locale. `tools/intent.py` y `tools/registry.py` reciben el
-  locale como parámetro o leen el holder (cuidado con imports circulares).
-- Pasar prompts y descripciones de tools a inglés (inventario 3.2), con la línea única
-  `"Always reply in {language_name}."`.
-- Sustituir los markers de stdout en español por markers neutros y adaptar
-  `backend/app/engine_bridge.py` y `desktop/bridge.py` **en el mismo commit**.
-- Ajustes de naturalidad en inglés: voz `af_heart`, `tts_speed` 1.0–1.05 (el 1.2 actual suena
-  acelerado en inglés), y añadir al system prompt "usa contracciones, nada de 'Certainly!' ni
-  'As an AI', y **escribe los números en palabras**" (los números literales son la fuente número
-  uno de TTS que suena a robot).
-- Regenerar el caché de audio de la tanda 2 para el nuevo locale.
+- **Markers renombrados, no JSON.** Mismo formato `[Tag]:`. Desktop y backend actualizados juntos.
+  `[Kimmi]:` no se tocó (contrato de streaming del HUD).
+- **Schemas de tools y `_CLASSIFY_SYSTEM` en inglés fijo** (no locale). Las plantillas de
+  `confirmation_prompt` sí van al locale porque se hablan.
+- **`nomic-embed-text` se queda.** Memoria vacía; migrar a `bge-m3` sigue siendo gratis.
+- **Voz inglesa: `af_heart` @ 1.0.** Comparada con `af_bella`, `af_nicole` y `af_sarah` a la misma
+  frase: nicole arrastra (~13 s frente a ~9 s); heart/sarah/bella están cerca. Se eligió heart.
+  `1.05` acorta poco y suena más tenso; se queda en `1.0`. Español sigue en `ef_dora` @ 1.2.
+- **LLM: se queda `qwen2.5:3b`.** Contra `llama3.2:3b` en inglés: ttft medio 240 vs 312 ms, y
+  qwen es más corto (mejor para voz). llama suena bien pero no justifica el coste.
+- **Guardia anti-CJK en el system prompt.** Sin ella, qwen2.5:3b mete dígitos CJK ~1 de cada 12
+  respuestas en inglés cuando se le pide escribir números en palabras.
+
+#### Resultados medidos
+
+Cobertura (13 cierres + 5 no-cierres, strip_wake, yes/no, rag_skip, confirm) en ambos idiomas:
+**todo OK.** Bridges: 21/21 desktop y 21/21 backend; los markers viejos en español ya no matchean.
+
+STT, frase sintetizada con Kokoro y re-transcrita con Whisper `medium` beam 1:
+
+| Idioma | con `stt_initial_prompt` | sin prompt |
+| --- | --- | --- |
+| en | "Kimmi" en 4/4, `avg_logprob` -0.06..-0.14 | "Kimmy" en 4/4 |
+| es | "Kimmi" en 3/3 | "Kimi" en 1/3 |
+
+El bias prompt en inglés es crítico: sin él `strip_wake_phrase` deja de funcionar.
+
+`ttfa` del camino de chat (texto inyectado, sin mic) contra la tanda 2:
+
+| Turno | tanda 2 (es) | tanda 3 en | tanda 3 es |
+| --- | --- | --- | --- |
+| saludo corto | 577 / 547 ms | 875 ms | 702 ms |
+| aritmética corta | 577 / 500 ms | 641 ms | 719 ms |
+| explicación GPU | 844 / 1140 ms | 2063 ms (`synth1=1483`) | 1782 ms (`synth1=938`, `filler=1203`) |
+
+Los turnos cortos se mueven con `synth1` (el inglés a 1.0 es más lento por chunk que el español a
+1.2, y la primera frase del LLM no es la misma cada tirada). El acuse cacheado sigue en
+`ttfa=0`. Cachés: 27 clips por locale en directorios distintos; segunda ejecución sintetiza 0.
+
+#### Hallazgos para la tanda 4
+
+- `set_locale()` ya existe; falta cebar el clip cache del idioma nuevo al cambiar y regenerar el
+  system prompt (hoy se cachea por código de idioma, así que un `set_locale` basta).
+- qwen2.5:3b sigue fallando aritmética corta ("thirty-four eleven" por 391) en ambos idiomas: no
+  es un problema de i18n, pero conviene no fiarse de él para números exactos sin la tool de calc.
+- El modelo aún se escapa a "How can I assist you today?" a veces pese a la prohibición explícita.
 
 ### Tanda 4 — Cambio de idioma
 
@@ -514,17 +529,16 @@ los `distil-*.en` aunque sean más rápidos.
 
 ## 9. Preguntas abiertas
 
-- **Embeddings multilingües.** ¿Migramos `nomic-embed-text` a `bge-m3` para que el RAG funcione
-  cross-lingual? Implica reindexar `memory/`. Decidir en la tanda 3.
-- **LLM para inglés.** `qwen2.5:3b` funciona, pero `llama3.2:3b` tiende a sonar más natural y
-  coloquial en inglés conversacional. Es una línea de config: merece un A/B en la tanda 3.
-- **`large-v3-turbo`.** Pendiente de medir contra `medium` con beam 1, una vez tengamos la
-  instrumentación de la tanda 1.
+- **Embeddings multilingües.** Cerrado en tanda 3: nos quedamos con `nomic-embed-text`. Revisar
+  si el RAG cross-lingual duele cuando haya recuerdos reales; migrar a `bge-m3` sigue siendo
+  gratis mientras `memory/` esté vacía.
+- **LLM para inglés.** Cerrado en tanda 3: `qwen2.5:3b` gana a `llama3.2:3b` en ttft y brevedad.
+- **Voz en inglés.** Cerrado en tanda 3: `af_heart` @ 1.0.
+- **`large-v3-turbo`.** Pendiente de medir contra `medium` con beam 1.
 - **Code-switching** dentro de una misma frase (mezclar inglés y español). Whisper multilingüe lo
   tolera, pero el TTS no: `lang` es un parámetro por llamada. Por ahora se asume una frase, un idioma.
-- **Voz en inglés.** `af_heart` es la recomendación por calidad, pero conviene escuchar
-  `af_bella` y `af_nicole` para elegir la que más se parezca al timbre de `ef_dora`, de forma que
-  Kimmi se sienta "la misma persona" en los dos idiomas.
+- **Aritmética del 3B.** qwen2.5:3b inventa productos cortos en ambos idiomas; la tool `calc`
+  (hoy apagada) es el remedio real, no el prompt.
 
 ---
 

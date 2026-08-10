@@ -170,7 +170,7 @@ class AudioSink:
             )
             self._stream.start()
         except Exception as exc:  # noqa: BLE001
-            print(f"  [Audio]: no se pudo abrir la salida ({exc}); TTS mudo.")
+            print(f"  [Audio]: could not open the output device ({exc}); TTS muted.")
             self._stream = None
             self._failed = True
             return False
@@ -406,7 +406,7 @@ class BargeInMonitor:
             try:
                 self._stream = self._open_stream()
             except Exception as exc:  # noqa: BLE001
-                print(f"  [Barge-in]: no se pudo abrir el mic monitor ({exc})")
+                print(f"  [Barge-in]: could not open the monitor mic ({exc})")
                 self._stream = None
         return self._stream
 
@@ -464,22 +464,22 @@ class BargeInMonitor:
     def _trigger(self, stream: Any, seed: List[bytes]) -> None:
         self._detected.set()
         self._capture_done.clear()
-        print("  [Barge-in]: te escuché; corto y te atiendo.")
+        print("  [Barge-in]: heard you; cutting the reply.")
 
         callback = self._on_detect
         if callback is not None:
             try:
                 callback()
             except Exception as exc:  # noqa: BLE001
-                print(f"  [Barge-in]: fallo al cortar el TTS ({exc})")
+                print(f"  [Barge-in]: failed to cut TTS ({exc})")
 
         try:
             captured = self._capture_utterance(stream, seed)
             with self._audio_lock:
                 self._audio = captured
-            print(f"  [Barge-in]: capturados {len(captured)} bytes de audio")
+            print(f"  [Barge-in]: captured {len(captured)} bytes of audio")
         except Exception as exc:  # noqa: BLE001
-            print(f"  [Barge-in]: no se pudo capturar audio ({exc})")
+            print(f"  [Barge-in]: could not capture audio ({exc})")
         finally:
             # One detection per turn; the caller re-arms on the next turn.
             self._armed.clear()
@@ -660,7 +660,7 @@ class SpeechPipeline:
             try:
                 waveform = self._synthesize(item, first)
             except Exception as exc:  # noqa: BLE001
-                print(f"  [TTS]: fallo sintetizando ({exc})")
+                print(f"  [TTS]: synthesis failed ({exc})")
                 continue
 
             if waveform is None or waveform.size == 0 or self._abort.is_set():

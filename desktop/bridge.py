@@ -37,7 +37,11 @@ _ERROR_MARKERS = (
 )
 
 _VOWELS = set("aeiouáéíóúüAEIOUÁÉÍÓÚÜ")
-_SPEECH_MARKERS = ("[Kimmi]:", "[Confirmación]:")
+_SPEECH_MARKERS = ("[Kimmi]:", "[Confirm]:")
+
+# The engine prints these in English regardless of the language it speaks in,
+# so this table stays valid across locales.
+READY_MARKER = "KIMMI READY"
 
 
 def parse_engine_line(line: str) -> Optional[tuple[PipelineState, str]]:
@@ -49,36 +53,36 @@ def parse_engine_line(line: str) -> Optional[tuple[PipelineState, str]]:
     if any(marker in text for marker in _ERROR_MARKERS):
         return "error", text
 
-    if "KIMMI EN ESPERA" in text or "Volviendo a estado de espera" in text:
+    if READY_MARKER in text or "KIMMI IDLE" in text:
         return "idle", text
 
     if (
-        "[Wake Word Detectado" in text
+        "[Wake Detected" in text
         or "[VAD]:" in text
-        or "Escuchando (sesión activa)" in text
-        or "Usando audio del barge-in" in text
+        or "Listening (active session)" in text
+        or "Using barge-in audio" in text
     ):
         return "listening", text
 
     if any(
         marker in text
         for marker in (
-            "[Tú]:",
+            "[You]:",
             "[Intent]:",
             "[LLM]:",
             "[Tools]:",
-            "[Cierre]:",
-            "[Sesión]:",
-            "[Memoria]:",
-            "[RAG Memoria]:",
+            "[Closing]:",
+            "[Session]:",
+            "[Memory]:",
+            "[RAG]:",
         )
     ):
         return "processing", text
 
-    if "[Kimmi]:" in text or "[Confirmación]:" in text:
+    if any(marker in text for marker in _SPEECH_MARKERS):
         return "responding", text
 
-    if "Kimmi ejecutando" in text:
+    if "[Running]:" in text:
         return "processing", text
 
     return None
@@ -258,7 +262,7 @@ class EngineBridge(QObject):
 
         # Stay in starting until the engine prints ready (ignore other chatter while loading).
         if not self._ready:
-            if state == "idle" and "KIMMI EN ESPERA" in (message or ""):
+            if state == "idle" and READY_MARKER in (message or ""):
                 self._ready = True
                 state = "idle"
             elif state == "error":

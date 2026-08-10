@@ -69,7 +69,7 @@ class ClipCache:
         try:
             waveform = np.load(path, allow_pickle=False)
         except Exception as exc:  # noqa: BLE001
-            print(f"  [Clips]: no se pudo leer {key[:8]} ({exc})")
+            print(f"  [Clips]: could not read {key[:8]} ({exc})")
             return None
 
         waveform = np.ascontiguousarray(waveform, dtype=np.float32).reshape(-1)
@@ -95,7 +95,7 @@ class ClipCache:
             try:
                 waveform = self._synthesize(text)
             except Exception as exc:  # noqa: BLE001
-                print(f"  [Clips]: fallo sintetizando {text!r} ({exc})")
+                print(f"  [Clips]: synthesis failed for {text!r} ({exc})")
                 continue
             if waveform is None or waveform.size == 0:
                 continue
@@ -105,7 +105,7 @@ class ClipCache:
                 np.save(self._path(key), waveform, allow_pickle=False)
                 synthesized += 1
             except Exception as exc:  # noqa: BLE001
-                print(f"  [Clips]: no se pudo guardar {text!r} ({exc})")
+                print(f"  [Clips]: could not save {text!r} ({exc})")
 
         self._write_manifest(wanted)
         self._prune(set(wanted))
@@ -119,7 +119,7 @@ class ClipCache:
             ) as handle:
                 json.dump(wanted, handle, ensure_ascii=False, indent=2, sort_keys=True)
         except Exception as exc:  # noqa: BLE001
-            print(f"  [Clips]: no se pudo escribir el manifest ({exc})")
+            print(f"  [Clips]: could not write the manifest ({exc})")
 
     def _prune(self, keep: set) -> None:
         """Drop clips for phrases that no longer exist in the code."""

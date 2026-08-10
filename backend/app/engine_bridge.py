@@ -31,22 +31,24 @@ def parse_engine_line(line: str) -> Optional[tuple[PipelineState, str]]:
     if not text:
         return None
 
-    if "KIMMI EN ESPERA" in text or "Volviendo a estado de espera" in text:
+    # The engine prints these in English regardless of the language it speaks in,
+    # so this table stays valid across locales.
+    if "KIMMI READY" in text or "KIMMI IDLE" in text:
         return "idle", text
 
-    if "[Wake Word Detectado" in text or "[VAD]:" in text:
+    if "[Wake Detected" in text or "[VAD]:" in text:
         return "listening", text
 
     if any(
         marker in text
-        for marker in ("[Tú]:", "[Intent]:", "[LLM]:", "[Tools]:", "[Cierre]:")
+        for marker in ("[You]:", "[Intent]:", "[LLM]:", "[Tools]:", "[Closing]:")
     ):
         return "processing", text
 
-    if "[Kimmi]:" in text or "[Confirmación]:" in text:
+    if "[Kimmi]:" in text or "[Confirm]:" in text:
         return "responding", text
 
-    if "Kimmi ejecutando" in text:
+    if "[Running]:" in text:
         return "processing", text
 
     return None

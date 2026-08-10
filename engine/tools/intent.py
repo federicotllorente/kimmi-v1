@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional, Set
 
 import ollama
 
+from locale_config import current_locale
+
 # Intents válidos y tools asociadas (subconjunto del schema completo).
 INTENT_TOOL_MAP: Dict[str, List[str]] = {
     "chat": [],
@@ -46,44 +48,26 @@ ALWAYS_CONFIRM_TOOLS = frozenset({
     "remember_fact",
 })
 
-_YES_RE = re.compile(
-    r"\b(s[ií]|dale|ok|okay|vale|confirmo|confirma|afirmativo|adelante|hazlo|claro)\b",
-    re.IGNORECASE,
-)
-_NO_RE = re.compile(
-    r"\b(no|nop|cancelar|cancela|cancele|negativo|para|alto|stop)\b",
-    re.IGNORECASE,
-)
-
-_MEMORY_OFFER_RE = re.compile(
-    r"(?i)("
-    r"quieres?\s+que\s+(?:lo\s+)?recuerde|"
-    r"lo\s+guardo\s+en\s+(?:la\s+)?memoria|"
-    r"guardo\s+(?:ese|este)\s+dato|"
-    r"anoto\s+(?:eso|ese\s+dato)|"
-    r"recuerde\s+(?:eso|ese\s+dato|que)"
-    r")"
-)
-
 _CLASSIFY_SYSTEM = (
-    "Eres un clasificador de intención para un asistente de voz llamado Kimmi. "
-    "Responde SOLO con un JSON válido, sin markdown ni texto extra. "
+    "You are an intent classifier for a voice assistant named Kimmi. "
+    "Reply ONLY with valid JSON, no markdown and no extra text. "
     "Schema: {\"intent\": string, \"confidence\": number, \"brief_reason\": string}. "
-    "intent debe ser exactamente uno de: chat, apps, files, code, docker, clipboard, calc, docs, memory, clarify. "
-    "Reglas: "
-    "chat = saludo, charla, pregunta general sin acción en el PC "
-    "(incluye preguntar por un dato que ya debería estar en memoria, sin pedir guardarlo); "
-    "apps = abrir o enfocar una aplicación; "
-    "files = listar, leer o escribir archivos/carpetas; "
-    "code = buscar en código, scaffold o agente Cursor; "
-    "docker = contenedores o compose; "
-    "clipboard = portapapeles; "
-    "calc = cálculos o conversiones numéricas; "
-    "docs = documentación web; "
-    "memory = el usuario pide EXPLÍCITAMENTE recordar, anotar o guardar un dato en memoria "
-    "(recuerda que..., anota..., guarda que...); "
-    "clarify = audio ambiguo, incompleto o no se entiende. "
-    "confidence entre 0 y 1. Si dudas, usa clarify con confidence baja."
+    "intent must be exactly one of: chat, apps, files, code, docker, clipboard, calc, docs, memory, clarify. "
+    "Rules: "
+    "chat = greeting, small talk, general question with no action on the PC "
+    "(including asking about something that should already be in memory, without asking to save it); "
+    "apps = open or focus an application; "
+    "files = list, read or write files and folders; "
+    "code = search code, scaffold, or the Cursor agent; "
+    "docker = containers or compose; "
+    "clipboard = the clipboard; "
+    "calc = calculations or numeric conversions; "
+    "docs = web documentation; "
+    "memory = the user EXPLICITLY asks to remember, note down or save something to memory "
+    "(remember that..., note..., save that...); "
+    "clarify = the audio is ambiguous, incomplete or unintelligible. "
+    "confidence between 0 and 1. When unsure, use clarify with low confidence. "
+    "The user may speak any language; classify the intent regardless."
 )
 
 
@@ -188,31 +172,33 @@ def tool_needs_confirmation(fn_name: str, fn_args: Optional[Dict[str, Any]] = No
 def confirmation_prompt(fn_name: str, fn_args: Optional[Dict[str, Any]] = None) -> str:
     """Frase corta para pedir confirmación por TTS."""
     args = fn_args or {}
+    templates = current_locale().confirm
+
     if fn_name == "launch_app":
-        app = args.get("app_id", "la aplicación")
+        app = args.get("app_id") or templates["default_app"]
         path = args.get("path") or ""
         if path:
-            return f"Voy a abrir {app} en {path}. ¿Confirmas?"
-        return f"Voy a abrir {app}. ¿Confirmas?"
+            return templates["launch_app_path"].format(app=app, path=path)
+        return templates["launch_app"].format(app=app)
     if fn_name == "write_file":
-        path = args.get("file_path", "un archivo")
-        return f"Voy a escribir en {path}. ¿Confirmas?"
+        path = args.get("file_path") or templates["default_path"]
+        return templates["write_file"].format(path=path)
     if fn_name == "run_cursor_agent":
-        return "Voy a delegar la tarea al agente de Cursor. ¿Confirmas?"
+        return templates["run_cursor_agent"]
     if fn_name == "scaffold_project":
-        name = args.get("name", "el proyecto")
-        return f"Voy a crear el scaffold {name}. ¿Confirmas?"
+        name = args.get("name") or templates["default_project"]
+        return templates["scaffold_project"].format(name=name)
     if fn_name == "remember_fact":
-        fact = str(args.get("fact", "ese dato")).strip()
+        fact = str(args.get("fact") or templates["default_fact"]).strip()
         short = fact if len(fact) <= 90 else fact[:87] + "..."
-        return f"Voy a recordar: {short}. ¿Confirmas?"
+        return templates["remember_fact"].format(fact=short)
     if fn_name == "manage_docker_container":
-        action = args.get("action", "esa acción")
-        return f"Voy a ejecutar Docker {action}. ¿Confirmas?"
+        action = args.get("action") or templates["default_action"]
+        return templates["manage_docker_container"].format(action=action)
     if fn_name == "manage_clipboard":
-        action = args.get("action", "modificar")
-        return f"Voy a {action} el portapapeles. ¿Confirmas?"
-    return "Voy a ejecutar esa acción. ¿Confirmas?"
+        action = args.get("action") or templates["default_clipboard_action"]
+        return templates["manage_clipboard"].format(action=action)
+    return templates["fallback"]
 
 
 def parse_yes_no(transcript: str) -> Optional[bool]:
@@ -220,8 +206,9 @@ def parse_yes_no(transcript: str) -> Optional[bool]:
     text = (transcript or "").strip().lower()
     if not text:
         return None
-    yes = bool(_YES_RE.search(text))
-    no = bool(_NO_RE.search(text))
+    loc = current_locale()
+    yes = bool(loc.yes_re.search(text))
+    no = bool(loc.no_re.search(text))
     if yes and not no:
         return True
     if no and not yes:
@@ -240,7 +227,7 @@ def last_assistant_offered_memory(history: Optional[List[Dict[str, Any]]]) -> bo
         if msg.get("role") != "assistant":
             continue
         content = str(msg.get("content") or "")
-        return bool(_MEMORY_OFFER_RE.search(content))
+        return bool(current_locale().memory_offer_re.search(content))
     return False
 
 

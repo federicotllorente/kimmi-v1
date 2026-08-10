@@ -134,16 +134,16 @@ def build_tools(
             "function": {
                 "name": "read_directory_files",
                 "description": (
-                    "SOLO si el usuario pide explícitamente leer el contenido de archivos "
-                    f"en el sandbox ({allowed_root}). NO usar para conversación general ni "
-                    "para solo listar nombres."
+                    "ONLY if the user explicitly asks to read the contents of files "
+                    f"in the sandbox ({allowed_root}). Do NOT use for general conversation "
+                    "or to just list names."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "directory_path": {
                             "type": "string",
-                            "description": 'Ruta relativa (ej: ".", "notas").',
+                            "description": 'Relative path (e.g. ".", "notes").',
                         },
                     },
                     "required": ["directory_path"],
@@ -155,16 +155,16 @@ def build_tools(
             "function": {
                 "name": "list_directory",
                 "description": (
-                    "SOLO si el usuario pide listar archivos o carpetas "
-                    f"dentro de {allowed_root}. NO usar para charla ni para leer contenido."
+                    "ONLY if the user asks to list files or folders "
+                    f"inside {allowed_root}. Do NOT use for small talk or to read contents."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string", "description": "Ruta relativa."},
+                        "path": {"type": "string", "description": "Relative path."},
                         "recursive": {
                             "type": "boolean",
-                            "description": "Si true, lista el árbol completo.",
+                            "description": "If true, list the whole tree.",
                         },
                     },
                     "required": ["path"],
@@ -176,8 +176,8 @@ def build_tools(
             "function": {
                 "name": "write_file",
                 "description": (
-                    "SOLO si el usuario pide explícitamente crear o sobrescribir un archivo "
-                    f"de texto en {allowed_root}. NO usar para conversación ni borradores no pedidos."
+                    "ONLY if the user explicitly asks to create or overwrite a text file "
+                    f"in {allowed_root}. Do NOT use for conversation or unrequested drafts."
                 ),
                 "parameters": {
                     "type": "object",
@@ -194,9 +194,9 @@ def build_tools(
             "function": {
                 "name": "run_cursor_agent",
                 "description": (
-                    "SOLO si el usuario pide explícitamente delegar una tarea de código al "
-                    f"agente de Cursor sobre {cursor_workspace}. NO para preguntas generales "
-                    "ni para editar sin haberlo pedido."
+                    "ONLY if the user explicitly asks to delegate a coding task to the "
+                    f"Cursor agent over {cursor_workspace}. NOT for general questions "
+                    "or for editing without being asked."
                 ),
                 "parameters": {
                     "type": "object",
@@ -204,7 +204,7 @@ def build_tools(
                         "prompt": {"type": "string"},
                         "brief": {
                             "type": "boolean",
-                            "description": "Si true (default), resume corto para voz.",
+                            "description": "If true (default), summarize short for speech.",
                         },
                     },
                     "required": ["prompt"],
@@ -216,9 +216,9 @@ def build_tools(
             "function": {
                 "name": "launch_app",
                 "description": (
-                    f"SOLO si el usuario pide abrir o lanzar una app allowlisted ({apps}). "
-                    "path puede ser carpeta, URL o alias (ej: assistant). "
-                    "NO usar si solo pregunta sobre apps o para enfocar una ya abierta."
+                    f"ONLY if the user asks to open or launch an allowlisted app ({apps}). "
+                    "path can be a folder, a URL or an alias (e.g. assistant). "
+                    "Do NOT use if they merely ask about apps, or to focus an open one."
                 ),
                 "parameters": {
                     "type": "object",
@@ -228,7 +228,7 @@ def build_tools(
                         "focus_after": {"type": "boolean"},
                         "profile": {
                             "type": "string",
-                            "description": "Para browser: default o work.",
+                            "description": "For browser: default or work.",
                         },
                     },
                     "required": ["app_id"],
@@ -240,8 +240,8 @@ def build_tools(
             "function": {
                 "name": "focus_window",
                 "description": (
-                    f"SOLO si el usuario pide enfocar o traer al frente una ventana "
-                    f"allowlisted ya abierta ({apps}). NO para abrir apps nuevas."
+                    "ONLY if the user asks to focus or bring forward an already open "
+                    f"allowlisted window ({apps}). NOT for opening new apps."
                 ),
                 "parameters": {
                     "type": "object",
@@ -258,9 +258,9 @@ def build_tools(
             "function": {
                 "name": "manage_clipboard",
                 "description": (
-                    "SOLO si el usuario pide leer, escribir, añadir, limpiar o ver el "
-                    "historial del portapapeles (read, write, append, clear, history). "
-                    "NO usar para conversación general."
+                    "ONLY if the user asks to read, write, append to, clear or view the "
+                    "clipboard history (read, write, append, clear, history). "
+                    "Do NOT use for general conversation."
                 ),
                 "parameters": {
                     "type": "object",
@@ -277,9 +277,9 @@ def build_tools(
             "function": {
                 "name": "exec_python_repl",
                 "description": (
-                    "SOLO si el usuario pide un cálculo, conversión o evaluación numérica. "
-                    "Python restringido (sesión con TTL), sin disco ni red. "
-                    "NO usar para preguntas que no sean cálculo."
+                    "ONLY if the user asks for a calculation, conversion or numeric evaluation. "
+                    "Restricted Python (session with a TTL), no disk and no network. "
+                    "Do NOT use for questions that are not calculations."
                 ),
                 "parameters": {
                     "type": "object",
@@ -296,9 +296,9 @@ def build_tools(
             "function": {
                 "name": "scaffold_project",
                 "description": (
-                    f"SOLO si el usuario pide crear un proyecto nuevo ({templates}) "
-                    f"dentro de {allowed_root}. open_in: cursor o vscode. "
-                    "NO usar sin petición explícita de crear scaffold."
+                    f"ONLY if the user asks to create a new project ({templates}) "
+                    f"inside {allowed_root}. open_in: cursor or vscode. "
+                    "Do NOT use without an explicit request to scaffold."
                 ),
                 "parameters": {
                     "type": "object",
@@ -317,9 +317,9 @@ def build_tools(
             "function": {
                 "name": "search_codebase",
                 "description": (
-                    "SOLO si el usuario pide buscar en el código "
-                    "(mode text, regex, semantic o files_only). "
-                    "NO usar para charla ni para listar carpetas sin búsqueda."
+                    "ONLY if the user asks to search the code "
+                    "(mode text, regex, semantic or files_only). "
+                    "Do NOT use for small talk or to list folders without searching."
                 ),
                 "parameters": {
                     "type": "object",
@@ -338,10 +338,10 @@ def build_tools(
             "function": {
                 "name": "manage_docker_container",
                 "description": (
-                    "SOLO si el usuario pide una acción Docker concreta: list, inspect, "
+                    "ONLY if the user asks for a concrete Docker action: list, inspect, "
                     "start, restart, logs, stats, top, compose_ps, compose_logs, "
-                    "compose_up, compose_down, compose_restart. Compose solo bajo el sandbox. "
-                    "NO usar para conversación sobre Docker sin acción."
+                    "compose_up, compose_down, compose_restart. Compose only under the sandbox. "
+                    "Do NOT use for conversation about Docker with no action."
                 ),
                 "parameters": {
                     "type": "object",
@@ -361,9 +361,9 @@ def build_tools(
             "function": {
                 "name": "fetch_web_docs",
                 "description": (
-                    "SOLO si el usuario pide consultar documentación web allowlisted "
-                    "(mode summary o extract). Pasa url o library+topic. "
-                    "NO usar para preguntas generales sin pedir docs."
+                    "ONLY if the user asks to look up allowlisted web documentation "
+                    "(mode summary or extract). Pass url, or library plus topic. "
+                    "Do NOT use for general questions that do not ask for docs."
                 ),
                 "parameters": {
                     "type": "object",
@@ -382,11 +382,11 @@ def build_tools(
             "function": {
                 "name": "remember_fact",
                 "description": (
-                    "Guarda un dato personal, preferencia, IP de dispositivo, pinout o nota "
-                    "técnica importante en la memoria permanente. "
-                    "Úsala cuando el usuario diga explícitamente que recuerdes algo "
-                    "(recuerda que..., anota que..., guarda en memoria...). "
-                    "NO la uses para charla normal ni para inventar hechos."
+                    "Store a personal detail, preference, device IP, pinout or important "
+                    "technical note in long-term memory. "
+                    "Use it when the user explicitly asks you to remember something "
+                    "(remember that..., note that..., save to memory...). "
+                    "Do NOT use it for normal small talk or to invent facts."
                 ),
                 "parameters": {
                     "type": "object",
@@ -394,14 +394,14 @@ def build_tools(
                         "fact": {
                             "type": "string",
                             "description": (
-                                "La información clara y concreta a recordar "
-                                '(ej: "La IP de la Raspberry Pi es 192.168.1.50").'
+                                "The clear, concrete piece of information to remember "
+                                '(e.g. "The Raspberry Pi IP is 192.168.1.50").'
                             ),
                         },
                         "category": {
                             "type": "string",
                             "description": (
-                                "Categoría opcional: general, network, hardware, preference, project."
+                                "Optional category: general, network, hardware, preference, project."
                             ),
                         },
                     },
@@ -453,36 +453,49 @@ def format_memory_block(memory_context: str) -> str:
     if not memory_context or not memory_context.strip():
         return ""
     return (
-        "Recuerdos relevantes recuperados de tu memoria permanente "
-        "(úsalos solo si ayudan a responder; no inventes otros):\n"
+        "Relevant memories retrieved from your long-term memory "
+        "(use them only if they help you answer; do not invent others):\n"
         f"{memory_context.strip()}"
     )
 
 
-def build_system_prompt(allowed_root: str) -> str:
+def build_system_prompt(allowed_root: str, language_name: str) -> str:
+    """One prompt in English, with the reply language as the only variable.
+
+    Kept single-language on purpose: two parallel prompts drift apart, and the
+    closing and tool-discipline rules are exactly the ones that must not.
+    """
     apps = ", ".join(list_allowed_app_ids())
 
     return (
-        "Eres Kimmi, un asistente local de voz: conciso, directo y útil. "
-        "Responde siempre en español con 1 o 2 oraciones conversacionales. "
-        "Sin markdown, asteriscos, guiones de lista ni numerales: tu respuesta se lee en voz alta. "
-        "CIERRE: si el usuario agradece, dice que está bien/listo, que no necesita nada más, "
-        "adiós o similar: responde SOLO con un cierre breve (de nada, cuando quieras). "
-        "PROHIBIDO en ese caso: preguntar si necesita algo más, proponer planes, viajes, "
-        "tareas nuevas o cualquier otra pregunta. "
-        "Nunca termines con signos de interrogación tras un cierre o agradecimiento. "
-        "MEMORIA: tienes memoria permanente con remember_fact. "
-        "Si el usuario pide explícitamente recordar o anotar un dato, usa remember_fact. "
-        "Si menciona un dato personal o técnico importante (IP, pinout, preferencia, contraseña de lab, etc.) "
-        "sin pedir guardarlo, pregunta primero si quiere que lo recuerdes; no llames a la tool hasta que diga que sí. "
-        "Si pregunta por algo que podría estar en memoria, apoyate en los recuerdos inyectados abajo. "
-        "DISCIPLINA DE HERRAMIENTAS: "
-        "Solo llama a una tool si el usuario pide una acción concreta "
-        "(abrir, listar, escribir, buscar en código, Docker, portapapeles, cálculo, docs, recordar). "
-        "Saludos, charla, opiniones o preguntas generales: responde SIN tools. "
-        "Si hay duda entre tools o faltan datos: pregunta, no ejecutes. "
-        "Prefiere cero tools a una incorrecta. Nunca inventes resultados de tools. "
-        f"Archivos solo dentro de {allowed_root}. "
-        f"Apps allowlisted: {apps}. "
-        "Usa como máximo una tool por turno."
+        "You are Kimmi, a local voice assistant: concise, direct and useful. "
+        f"Always reply in {language_name}, in one or two conversational sentences. "
+        "No markdown, asterisks, bullet dashes or numbering: your answer is read out loud. "
+        "SOUND HUMAN: use contractions. Never say 'Certainly!', 'Sure thing!', 'As an AI' "
+        "or 'How can I assist you today?'. "
+        "Write numbers as words ('twenty-three', not '23'), because they are spoken. "
+        # Small models leak CJK digits where a numeral would go once the rule above
+        # pushes them away from digits. Measured: 1 in 12 replies without this line.
+        "Use only the writing system of that language: never mix in another script. "
+        "CLOSING: if the user thanks you, says they are fine or done, that they need "
+        "nothing else, goodbye or similar: reply ONLY with a short closing "
+        "(you're welcome, anytime). "
+        "FORBIDDEN in that case: asking whether they need anything else, proposing plans, "
+        "trips, new tasks or any other question. "
+        "Never end with a question mark after a closing or a thank you. "
+        "MEMORY: you have long-term memory through remember_fact. "
+        "If the user explicitly asks you to remember or note something down, use remember_fact. "
+        "If they mention an important personal or technical detail (IP, pinout, preference, "
+        "lab password, etc.) without asking you to save it, ask first whether they want you "
+        "to remember it; do not call the tool until they say yes. "
+        "If they ask about something that might be in memory, lean on the memories injected below. "
+        "TOOL DISCIPLINE: "
+        "Only call a tool if the user asks for a concrete action "
+        "(open, list, write, search code, Docker, clipboard, calculation, docs, remember). "
+        "Greetings, small talk, opinions or general questions: answer WITHOUT tools. "
+        "If you are unsure which tool applies or data is missing: ask, do not execute. "
+        "Prefer zero tools over the wrong one. Never invent tool results. "
+        f"Files only inside {allowed_root}. "
+        f"Allowlisted apps: {apps}. "
+        "Use at most one tool per turn."
     )
