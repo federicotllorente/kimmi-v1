@@ -315,9 +315,10 @@ print("Cargando modelo Wake Word...")
 oww_model = Model(
     wakeword_models=[
         "oww/kee_me.onnx",       # "Kimmi"
+        "oww/ghee_me.onnx",       # "Kimmi" (suena más parecido a como se pronuncia en español)
         "oww/hey_kee_me.onnx",   # "Hey Kimmi"
         "oww/okay_kee_me.onnx",  # "OK Kimmi"
-        "oww/eigh_ghee_me.onnx", # "Ey Kimmi" (suena más natural en español)
+        "oww/eigh_ghee_me.onnx", # "Ey Kimmi" (suena más parecido a como se pronuncia en español)
     ],
     inference_framework="onnx",
 )
