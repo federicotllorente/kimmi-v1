@@ -49,6 +49,11 @@ from tools.intent import (
 )
 from tools.registry import build_system_prompt, build_tools, format_memory_block, tools_for_intent
 from tools.memory import memory_db
+from tools.soft_memory import (
+    mark_memory_written_this_turn,
+    reset_memory_written_this_turn,
+    schedule_soft_memory,
+)
 
 # The reply is streamed to stdout token by token. On a Windows console that is
 # cp1252 by default, a single curly quote or dash from the model raises
@@ -1459,6 +1464,9 @@ def _run_tools_turn(
     except Exception as exc:  # noqa: BLE001
         tool_result = f"Error al ejecutar {fn_name}: {exc}"
 
+    if fn_name == "remember_fact" and str(tool_result).startswith("Recuerdo guardado"):
+        mark_memory_written_this_turn()
+
     messages.append(response["message"])
     messages.append({
         "role": "tool",
@@ -1477,6 +1485,7 @@ def handle_user_turn(
     Devuelve el texto final del asistente para el historial.
     """
     _filler_played.clear()
+    reset_memory_written_this_turn()
 
     # Explicit language switch: pre-baked ack in the NEW language, no LLM.
     target = match_language_switch(user_text)
@@ -1671,6 +1680,7 @@ def run_conversation_session(
                 continue
 
             closing = is_conversation_closing(user_text)
+            lang_switch = match_language_switch(user_text) is not None
             # Limpia captura previa por si acaso; speak_text/_chat_reply la rellenan.
             take_barge_in_audio()
             assistant_text = handle_user_turn(
@@ -1688,6 +1698,14 @@ def run_conversation_session(
             max_msgs = HISTORY_MAX_TURNS * 2
             if len(conversation_history) > max_msgs:
                 conversation_history[:] = conversation_history[-max_msgs:]
+
+            # Soft-auto memory: after TTS, never on the TTFA path.
+            schedule_soft_memory(
+                user_text,
+                assistant_text,
+                model=FAST_MODEL,
+                skip=closing or lang_switch,
+            )
 
             if closing:
                 print("  [Session]: closing detected")

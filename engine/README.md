@@ -41,6 +41,7 @@ python -m pip install -r requirements.txt
 | **Kokoro ONNX** (o Piper) | Text-to-speech ES/EN |
 | **MQTT** (`mqtt_bus.py`) | Estados del pipeline + toasts (desktop) |
 | **JobManager** (`jobs.py`) | Tareas largas en background + avisos |
+| **Memoria** (ChromaDB + soft-auto) | Hechos a largo plazo + RAG; ver [Memoria de Kimmi](#memoria-de-kimmi) |
 | **`tools/`** | Acciones locales sandboxed / allowlist |
 
 ---
@@ -125,6 +126,7 @@ Para salir: `Ctrl+C` (o cierra el desktop: corta MQTT, engine y Mosquitto propio
 | `KIMMI_RESEARCH_MODEL` / `KIMMI_FAST_MODEL` | Modelos Ollama para síntesis / planning de jobs |
 | `KIMMI_CLAUDE_MODEL` / `KIMMI_CHATGPT_MODEL` | Override cloud |
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | Síntesis cloud (research / competencia) |
+| `KIMMI_SOFT_MEMORY` | `1` (default) = soft-auto memory en background; `0` la desactiva |
 
 ### MQTT (Fase A)
 
@@ -228,6 +230,91 @@ Memoria permanente (ChromaDB) → `memory/` (gitignored salvo `.gitkeep`).
 
 ---
 
+## Memoria de Kimmi
+
+Kimmi combina **dos memorias** distintas. Confundirlas es la causa habitual de “¿por qué no se acuerda?”.
+
+| Capa | Dónde vive | Qué guarda | Duración |
+|------|------------|------------|----------|
+| Corto plazo | Lista en RAM (`conversation_history`) | Últimos turnos user/assistant | Solo la sesión activa (~6 pares; `HISTORY_MAX_TURNS`) |
+| Largo plazo | ChromaDB en [`memory/`](memory/) | Hechos durables (IP, preferencias, hardware, proyecto…) | Entre reinicios y sesiones |
+
+El corto plazo alimenta el LLM como historial de chat. El largo plazo es un **RAG** clásico: embeber → buscar por similitud → inyectar bullets en el mensaje del usuario (no en el system prompt, para no romper el KV cache de Ollama).
+
+### Stack
+
+- **Almacén:** ChromaDB (`PersistentClient`), colección `kimmi_knowledge`, espacio cosine.
+- **Embeddings:** Ollama + `nomic-embed-text` (`keep_alive=24h`). Hay que tener el modelo: `ollama pull nomic-embed-text`.
+- **Código:** [`tools/memory.py`](tools/memory.py) (CRUD + RAG), [`tools/soft_memory.py`](tools/soft_memory.py) (auto-guardado), [`tools/remember_fact.py`](tools/remember_fact.py) (tool explícita).
+- **Metadata por hecho:** `category`, `created_at`, `source` (`explicit` \| `soft_auto`).
+
+### Lectura (RAG, cada turno)
+
+Antes del LLM, en el camino caliente:
+
+1. Gates baratos: query muy corta, saludos/`rag_skip_re`, o colección vacía → no se paga embedding (`rag≈0`).
+2. Si hay datos: embedding de lo que dijo el usuario + top‑k en Chroma (hasta 3).
+3. Filtro por distancia cosine (`MAX_DISTANCE ≈ 0.45`) y margen respecto al mejor hit.
+4. El bloque se pega al **mensaje de usuario** (“Relevant memories retrieved…”).
+
+Preguntar *“¿Cuál es la IP de la Pi?”* es charla normal: **no** llama tools; responde con lo que el RAG inyectó (si hay hit).
+
+### Escritura: dos caminos
+
+```text
+Usuario menciona un hecho
+        │
+        ├─ “Recuerda que…” / confirma oferta sensible
+        │     → intent/tool remember_fact (+ confirmación por voz)
+        │     → Chroma (source=explicit)
+        │
+        └─ Hecho durable de bajo riesgo, sin pedirlo
+              → responde normal (TTS)
+              → en background: soft-auto → Chroma (source=soft_auto)
+```
+
+#### 1) Explícito — `remember_fact`
+
+- El usuario pide guardar (*“recuerda que…”*, *“anota que…”*) o confirma tras una oferta.
+- Siempre pide **confirmación por voz** (está en `ALWAYS_CONFIRM_TOOLS`).
+- Categorías tipicas del schema: `general`, `network`, `hardware`, `preference`, `project`.
+
+#### 2) Soft-auto (opción A, default on)
+
+Tras el turno (TTS ya sonó), un worker de **1 hilo** (`ThreadPoolExecutor`, no el `JobManager`) puede guardar en silencio:
+
+1. **Gate** (sin LLM): texto corto (menos de ~20 chars), cierre/saludo, secreto detectado, o sin señales de dato estable (IP, “mi/my”, preferencias, hardware, números…) → no hace nada.
+2. **Extractor:** `qwen2.5:3b` devuelve JSON con 0–2 hechos; solo parafrasea al **usuario**; categorías allowlist `preference|network|hardware|project|general`.
+3. **Filtros:** secretos por regex, groundedness mínima, longitud.
+4. **Dedup:** si ya hay un vecino con distancia ≤ `0.25`, no escribe.
+5. **Write** en Chroma con `source=soft_auto`. Solo logs (`[Memory]: soft-auto saved|skipped|…`); **nunca habla**.
+
+No corre en cierres, cambio de idioma, ni si ese turno ya guardó con `remember_fact`. Kill-switch: `KIMMI_SOFT_MEMORY=0` (también `false` / `no` / `off`).
+
+### Secretos y privacidad
+
+Soft-auto **no** guarda passwords, PINs, API keys, tokens, etc. (prompt del extractor + regex). Para eso el modelo puede ofrecer recordar y, si el usuario acepta, pasa por `remember_fact` con confirmación.
+
+Hoy **no** hay tool de “olvida X” / listar memorias. En desarrollo: borrar el contenido de `memory/` (salvo `.gitkeep`) resetea la base.
+
+### Requisitos y límites
+
+- Paquete `chromadb` + Ollama con `nomic-embed-text`.
+- Embeddings anglocéntricos: el recall cross-lingual (hecho en ES, pregunta en EN) puede degradarse; migrar a un embedder multilingüe implicaría reindexar.
+- No indexa PDFs, el repo ni el historial entero: solo hechos que entran por soft-auto o `remember_fact`.
+- El research agent (SearXNG) es otro canal; no usa Chroma.
+
+### Ejemplos rápidos
+
+| Dices | Qué pasa |
+|-------|----------|
+| *“La IP de la Pi es 192.168.1.50”* | Soft-auto puede guardarlo en background; luego *“¿cuál es la IP?”* → RAG |
+| *“Recuerda que la IP es …”* | `remember_fact` + confirmación por voz |
+| *“Mi password del lab es …”* | Soft-auto no guarda; puede ofrecer y pedir confirmación |
+| *“Hola”* / *“gracias”* | Sin extractor ni RAG caro (gates) |
+
+---
+
 ## Qué puedes pedirle (guía de uso)
 
 Habla en lenguaje natural. No hace falta el nombre exacto de la tool.
@@ -240,12 +327,14 @@ Habla en lenguaje natural. No hace falta el nombre exacto de la tool.
 - *“Corre un job demo de treinta segundos”* → `run_demo_long_job`
 - *“¿Cómo va el job?”* / *“Léeme el resumen”* → `list_jobs` / `get_job_status` / `read_job_result`
 
-### Memoria permanente (RAG)
+### Memoria
 
-- *“Recuerda que la IP de la Raspberry Pi es 192.168.1.50”* → `remember_fact` (pide confirmación)
-- Si mencionas un dato importante sin pedirlo, puede preguntar *“¿Quieres que lo recuerde?”*
-- *“¿Cuál es la IP de la Pi?”* → RAG antes de responder, sin tool
-- Requiere `ollama pull nomic-embed-text` y `chromadb`
+Detalle completo en [Memoria de Kimmi](#memoria-de-kimmi). Resumen:
+
+- Soft-auto guarda preferencias / IPs / hardware / proyecto sin que lo pidas (`KIMMI_SOFT_MEMORY=0` para apagar).
+- *“Recuerda que …”* → `remember_fact` (confirmación).
+- *“¿Cuál es la IP de la Pi?”* → RAG, sin tool.
+- Secretos no van por soft-auto.
 
 ### Archivos y código
 
@@ -320,7 +409,7 @@ tools/
   llm_cloud.py        # Ollama / Claude / ChatGPT (jobs)
   research_agent.py   # start_research + worker
   competition_agent.py
-  remember_fact.py / memory.py
+  remember_fact.py / memory.py / soft_memory.py
   …                   # apps, files, docker, clipboard, etc.
 memory/               # ChromaDB (gitignored)
 .kimmi_cache/         # Jobs, clips, docs cache

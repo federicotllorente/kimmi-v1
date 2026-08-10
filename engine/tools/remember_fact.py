@@ -6,4 +6,4 @@ from tools.memory import memory_db
 
 def remember_fact(fact: str, category: str = "general") -> str:
     """Guarda un dato, preferencia, IP, pinout o nota técnica importante."""
-    return memory_db.add_memory(fact, category=category)
+    return memory_db.add_memory(fact, category=category, source="explicit")

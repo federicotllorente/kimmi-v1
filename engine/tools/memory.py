@@ -6,11 +6,10 @@ Requiere: chromadb, ollama, y el modelo nomic-embed-text (`ollama pull nomic-emb
 from __future__ import annotations
 
 import os
-import re
 import time
 import uuid
 from collections import OrderedDict
-from typing import Any, List, Optional
+from typing import List, Optional, Tuple
 
 import chromadb
 import ollama
@@ -22,6 +21,8 @@ DEFAULT_DB_PATH = os.path.join(_ENGINE_DIR, "memory")
 DEFAULT_EMBED_MODEL = "nomic-embed-text"
 # Distancia máxima (cosine en Chroma ≈ 1 - similitud). Hits peores se descartan.
 MAX_DISTANCE = 0.45
+# Soft-auto / dedup: below this cosine distance the candidate is treated as a duplicate.
+DEDUP_DISTANCE = 0.25
 MAX_FACT_CHARS = 800
 MAX_CONTEXT_CHARS = 1200
 # Mantener el modelo de embeddings cargado: sin esto usa el default de 5 min y
@@ -33,6 +34,8 @@ QUERY_CACHE_SIZE = 32
 # Un embedding por turno es caro. Saludos y muletillas nunca aportan contexto.
 # El patrón por idioma vive en el locale como rag_skip_re.
 _SKIP_QUERY_MIN_CHARS = 8
+
+VALID_SOURCES = frozenset({"explicit", "soft_auto"})
 
 
 class KimmiMemory:
@@ -70,7 +73,12 @@ class KimmiMemory:
             return list(embedding)
         raise RuntimeError("Ollama no devolvió embedding.")
 
-    def add_memory(self, text: str, category: str = "general") -> str:
+    def add_memory(
+        self,
+        text: str,
+        category: str = "general",
+        source: str = "explicit",
+    ) -> str:
         """Guarda un nuevo dato o preferencia en la memoria vectorial."""
         fact = (text or "").strip()
         if not fact:
@@ -79,6 +87,9 @@ class KimmiMemory:
             return f"El dato es demasiado largo (máximo {MAX_FACT_CHARS} caracteres)."
 
         category = (category or "general").strip().lower()[:64] or "general"
+        src = (source or "explicit").strip().lower()
+        if src not in VALID_SOURCES:
+            src = "explicit"
         doc_id = f"mem_{uuid.uuid4().hex[:12]}"
 
         try:
@@ -98,6 +109,7 @@ class KimmiMemory:
                     {
                         "category": category,
                         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "source": src,
                     }
                 ],
             )
@@ -107,6 +119,42 @@ class KimmiMemory:
         self._count_cache = None
         self._query_cache.clear()
         return f"Recuerdo guardado ({doc_id})."
+
+    def find_similar(
+        self,
+        text: str,
+        n: int = 1,
+    ) -> Optional[Tuple[str, float]]:
+        """Nearest stored fact and cosine distance, or None if empty/unavailable."""
+        fact = (text or "").strip()
+        if not fact:
+            return None
+        count = self._cached_count()
+        if count == 0:
+            return None
+        k = max(1, min(int(n), 5, count))
+        try:
+            query_vector = self._get_embedding(fact)
+            results = self.collection.query(
+                query_embeddings=[query_vector],
+                n_results=k,
+                include=["documents", "distances"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [Memory]: find_similar failed: {exc}")
+            return None
+
+        documents = (results.get("documents") or [[]])[0]
+        distances = (results.get("distances") or [[]])[0]
+        if not documents or not str(documents[0] or "").strip():
+            return None
+        dist = 999.0
+        if distances and distances[0] is not None:
+            try:
+                dist = float(distances[0])
+            except (TypeError, ValueError):
+                dist = 999.0
+        return (str(documents[0]).strip(), dist)
 
     def _cached_count(self) -> int:
         if self._count_cache is None:
