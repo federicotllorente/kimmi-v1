@@ -26,6 +26,8 @@ ENABLED = os.environ.get("KIMMI_PERF", "1").strip().lower() not in _OFF_VALUES
 _FIELD_ORDER = (
     "earcon",
     "stt",
+    "partial_n",
+    "partial_ms",
     "lang_detect",
     "lang_switch",
     "rag",

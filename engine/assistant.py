@@ -34,6 +34,7 @@ from locale_config import (
     match_language_switch,
     set_locale,
 )
+from partial_stt import PartialSttWorker
 from mqtt_bus import bus as mqtt_bus
 from jobs import JobManager, peek_announcement_count, pop_announcement
 import jobs as jobs_mod
@@ -139,10 +140,21 @@ BARGE_IN_CAPTURE_SILENCE_SEC = 0.85  # fin de la frase del usuario tras cortar T
 # Nombre del usuario para el acuse del wake word.
 USER_NAME = "Fede"
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
 # Feature flags
-ENABLE_INTENT_ROUTER = False  # Clasificar intent antes de responder (añade latencia)
+ENABLE_INTENT_ROUTER = True  # Clasificar intent antes de responder (añade latencia)
 ENABLE_TOOLS = True  # Function calling / acciones locales (web_search, jobs, …)
 ENABLE_DEMO_JOBS = True  # run_demo_long_job for Phase B validation
+# Rolling Whisper (tiny) while the user speaks. Final medium STT is unchanged.
+ENABLE_PARTIAL_STT = _env_flag("KIMMI_PARTIAL_STT", False)
+PARTIAL_STT_INTERVAL_MS = 800
+PARTIAL_STT_MIN_AUDIO_SEC = 0.8
 
 # Relleno hablado cuando el turno se va de tiempo. El umbral se mide desde el
 # corte del VAD, no desde el LLM: hoy un turno normal empieza a sonar entre 830
@@ -305,6 +317,9 @@ lang_detect_model = WhisperModel(
     device="cuda",
     compute_type="float16",
 )
+# Shared with PartialSttWorker so rolling STT never races detect_language.
+_partial_stt_lock = threading.Lock()
+_last_partial_stt_stats: Optional[Dict[str, float]] = None
 
 audio = pyaudio.PyAudio()
 
@@ -1064,6 +1079,57 @@ def drain_job_announcements(mic_stream) -> None:
 
 
 # --- CAPTURA Y TRANCRIPCIÓN ---
+def take_partial_stt_stats() -> Optional[Dict[str, float]]:
+    """Consume stats from the last partial-STT capture (or None)."""
+    global _last_partial_stt_stats
+    stats = _last_partial_stt_stats
+    _last_partial_stt_stats = None
+    return stats
+
+
+def _record_partial_stt_stats(stats: Dict[str, float]) -> None:
+    """Stash + print summary so A/B works even before perf.start_turn."""
+    global _last_partial_stt_stats
+    calls = int(stats.get("calls", 0))
+    total_ms = float(stats.get("total_ms", 0.0))
+    _last_partial_stt_stats = {"calls": float(calls), "total_ms": total_ms}
+    print(f"[partial_stt]: calls={calls} total_ms={total_ms:.0f}")
+
+
+def _emit_partial_stt_perf() -> None:
+    """Attach last partial STT stats to the active turn perf line."""
+    stats = take_partial_stt_stats()
+    if not stats:
+        return
+    calls = int(stats.get("calls", 0))
+    if calls <= 0:
+        return
+    perf.value("partial_n", calls)
+    perf.value("partial_ms", int(stats.get("total_ms", 0.0)))
+
+
+def _start_partial_stt_worker() -> Optional[PartialSttWorker]:
+    if not ENABLE_PARTIAL_STT:
+        return None
+    worker = PartialSttWorker(
+        model=lang_detect_model,
+        model_lock=_partial_stt_lock,
+        language=current_locale().whisper_language,
+        rate=RATE,
+        interval_ms=PARTIAL_STT_INTERVAL_MS,
+        min_audio_sec=PARTIAL_STT_MIN_AUDIO_SEC,
+    )
+    worker.start()
+    return worker
+
+
+def _stop_partial_stt_worker(worker: Optional[PartialSttWorker]) -> None:
+    if worker is None:
+        return
+    stats = worker.stop()
+    _record_partial_stt_stats(stats)
+
+
 def record_user_audio_vad(
     stream,
     prompt: str = "",
@@ -1087,6 +1153,7 @@ def record_user_audio_vad(
     has_spoken = False
     silent_chunks = 0
     wait_chunks = 0
+    partial = _start_partial_stt_worker()
 
     chunk_duration_sec = VAD_CHUNK / RATE
     max_silent_chunks = int(SILENCE_LIMIT_SEC / chunk_duration_sec)
@@ -1099,51 +1166,64 @@ def record_user_audio_vad(
         else None
     )
 
-    if seed_audio:
-        has_spoken, silent_chunks = _apply_seed_audio_to_recording(
-            seed_audio, frames, pre_roll
-        )
-        if has_spoken:
-            print("  [VAD]: Voz detectada (pre-roll wake)...")
-            if silent_chunks >= max_silent_chunks:
-                print("  [VAD]: end of turn on silence (in seed).")
-                return b"".join(frames)
-
-    total_chunks = 0
-    vad_model.reset_states()
-
-    while total_chunks < max_total_chunks:
-        data = stream.read(VAD_CHUNK, exception_on_overflow=False)
-        total_chunks += 1
-
-        audio_int16 = np.frombuffer(data, dtype=np.int16)
-        audio_float32 = audio_int16.astype(np.float32) / 32768.0
-        tensor_chunk = torch.from_numpy(audio_float32)
-
-        speech_prob = vad_model(tensor_chunk, RATE).item()
-
-        if speech_prob > 0.5:
-            if not has_spoken:
-                print("  [VAD]: Voz detectada...")
-                has_spoken = True
-                frames.extend(pre_roll)
-            frames.append(data)
-            silent_chunks = 0
-        else:
+    try:
+        if seed_audio:
+            has_spoken, silent_chunks = _apply_seed_audio_to_recording(
+                seed_audio, frames, pre_roll
+            )
             if has_spoken:
-                frames.append(data)
-                silent_chunks += 1
+                print("  [VAD]: Voz detectada (pre-roll wake)...")
+                for chunk in frames:
+                    if partial is not None:
+                        partial.feed(chunk)
                 if silent_chunks >= max_silent_chunks:
-                    print("  [VAD]: end of turn on silence.")
-                    break
-            else:
-                pre_roll.append(data)
-                wait_chunks += 1
-                if max_wait_chunks is not None and wait_chunks >= max_wait_chunks:
-                    print("  [VAD]: Sin voz (timeout de escucha).")
-                    return b""
+                    print("  [VAD]: end of turn on silence (in seed).")
+                    return b"".join(frames)
 
-    return b"".join(frames)
+        total_chunks = 0
+        vad_model.reset_states()
+
+        while total_chunks < max_total_chunks:
+            data = stream.read(VAD_CHUNK, exception_on_overflow=False)
+            total_chunks += 1
+
+            audio_int16 = np.frombuffer(data, dtype=np.int16)
+            audio_float32 = audio_int16.astype(np.float32) / 32768.0
+            tensor_chunk = torch.from_numpy(audio_float32)
+
+            speech_prob = vad_model(tensor_chunk, RATE).item()
+
+            if speech_prob > 0.5:
+                if not has_spoken:
+                    print("  [VAD]: Voz detectada...")
+                    has_spoken = True
+                    frames.extend(pre_roll)
+                    if partial is not None:
+                        for chunk in pre_roll:
+                            partial.feed(chunk)
+                frames.append(data)
+                if partial is not None:
+                    partial.feed(data)
+                silent_chunks = 0
+            else:
+                if has_spoken:
+                    frames.append(data)
+                    if partial is not None:
+                        partial.feed(data)
+                    silent_chunks += 1
+                    if silent_chunks >= max_silent_chunks:
+                        print("  [VAD]: end of turn on silence.")
+                        break
+                else:
+                    pre_roll.append(data)
+                    wait_chunks += 1
+                    if max_wait_chunks is not None and wait_chunks >= max_wait_chunks:
+                        print("  [VAD]: Sin voz (timeout de escucha).")
+                        return b""
+
+        return b"".join(frames)
+    finally:
+        _stop_partial_stt_worker(partial)
 
 
 def _pcm16_to_float32(audio_bytes: bytes) -> np.ndarray:
@@ -1229,11 +1309,12 @@ def _detect_language_sync(
         max_samples = RATE * 3
         if prefix.size > max_samples:
             prefix = prefix[:max_samples]
-        lang_raw, prob_raw, _all = lang_detect_model.detect_language(
-            audio=prefix,
-            language_detection_segments=1,
-            language_detection_threshold=0.5,
-        )
+        with _partial_stt_lock:
+            lang_raw, prob_raw, _all = lang_detect_model.detect_language(
+                audio=prefix,
+                language_detection_segments=1,
+                language_detection_threshold=0.5,
+            )
         lang = (lang_raw or "").strip().lower()
         prob = float(prob_raw)
         target = _map_whisper_to_locale(lang)
@@ -1648,6 +1729,7 @@ def run_conversation_session(
             perf.start_turn()
             play_earcon()
             with perf.span("stt"):
+                _emit_partial_stt_perf()
                 user_text, stt_ok = transcribe_for_turn(user_audio_bytes)
             if first_turn and stt_ok:
                 stripped = strip_wake_phrase(user_text)
@@ -1666,6 +1748,7 @@ def run_conversation_session(
                     perf.start_turn()
                     play_earcon()
                     with perf.span("stt"):
+                        _emit_partial_stt_perf()
                         user_text, stt_ok = transcribe_for_turn(user_audio_bytes)
                     if stt_ok:
                         user_text = strip_wake_phrase(user_text)
@@ -1856,8 +1939,9 @@ def main():
     )
     print(
         f"Flags: INTENT_ROUTER={ENABLE_INTENT_ROUTER} | TOOLS={ENABLE_TOOLS} | "
-        f"DEMO_JOBS={ENABLE_DEMO_JOBS} | TTS={TTS_ENGINE} | "
-        f"CONVERSATION={CONVERSATION_MODE} | BARGE_IN={BARGE_IN_ENABLED}"
+        f"DEMO_JOBS={ENABLE_DEMO_JOBS} | PARTIAL_STT={ENABLE_PARTIAL_STT} | "
+        f"TTS={TTS_ENGINE} | CONVERSATION={CONVERSATION_MODE} | "
+        f"BARGE_IN={BARGE_IN_ENABLED}"
     )
 
     try:

@@ -36,7 +36,7 @@ python -m pip install -r requirements.txt
 |-------|-----|
 | **openWakeWord** | Detecta la wake word (`hey_kee_me`) |
 | **Silero VAD** | Fin de turno / barge-in |
-| **faster-whisper** (`medium`) | Speech-to-text (GPU recomendada) |
+| **faster-whisper** (`medium` + `tiny`) | STT final; idioma + parciales opcionales — ver [Speech-to-text](#speech-to-text-stt) |
 | **Ollama** (`qwen2.5:3b` + `qwen2.5:14b`) | Chat rápido; 14B para tools / resumen post-tool |
 | **Kokoro ONNX** (o Piper) | Text-to-speech ES/EN |
 | **MQTT** (`mqtt_bus.py`) | Estados del pipeline + toasts (desktop) |
@@ -127,6 +127,7 @@ Para salir: `Ctrl+C` (o cierra el desktop: corta MQTT, engine y Mosquitto propio
 | `KIMMI_CLAUDE_MODEL` / `KIMMI_CHATGPT_MODEL` | Override cloud |
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | Síntesis cloud (research / competencia) |
 | `KIMMI_SOFT_MEMORY` | `1` (default) = soft-auto memory en background; `0` la desactiva |
+| `KIMMI_PARTIAL_STT` | `1` = STT parcial en rolling (`[You~]:`) mientras hablas (default off); detalle en [Speech-to-text](#speech-to-text-stt) |
 
 ### MQTT (Fase A)
 
@@ -183,6 +184,7 @@ En [`assistant.py`](assistant.py) puedes ajustar:
 - `CURSOR_WORKSPACE` / `CURSOR_MODEL`
 - `HISTORY_MAX_TURNS`
 - `WHISPER_MODEL_SIZE` / `WHISPER_BEAM_SIZE`
+- `ENABLE_PARTIAL_STT` vía env `KIMMI_PARTIAL_STT` (STT parcial; ver [Speech-to-text](#speech-to-text-stt))
 
 ---
 
@@ -227,6 +229,112 @@ El router (opcional) vive en [`tools/intent.py`](tools/intent.py). Las tools se 
 
 Cachés locales (embeddings, docs, jobs, clips TTS) → `.kimmi_cache/` (gitignored).  
 Memoria permanente (ChromaDB) → `memory/` (gitignored salvo `.gitkeep`).
+
+---
+
+## Speech-to-text (STT)
+
+Kimmi no transcribe en streaming de punta a punta: **primero corta el turno con VAD**, y **después** pasa el PCM a Whisper. El texto que llega al LLM es siempre el del STT **final** (`medium`). Opcionalmente, con un feature flag, puede emitir hipótesis parciales **mientras** grabas (solo feedback / métricas; no alimentan el LLM).
+
+### Piezas
+
+| Pieza | Rol |
+|-------|-----|
+| Silero VAD | Decide cuándo empieza y termina la frase (`record_user_audio_vad`) |
+| faster-whisper `medium` | Transcript autoritativo del turno (`transcribe_audio` / `transcribe_for_turn`) |
+| faster-whisper `tiny` | Detección de idioma (~15 ms) y, si el flag está on, STT parcial rolling |
+| Locale (`locale_config`) | Idioma fijo para Whisper (`es` / `en`), `initial_prompt` con nombre y apps |
+
+Audio de captura: **16 kHz**, mono, PCM int16. El VAD trabaja en chunks de 512 muestras (~32 ms).
+
+### Camino feliz (sin parciales)
+
+```text
+Mic → VAD (Silero)
+        │  silencio post-habla / timeout / max duración
+        ▼
+PCM completo del turno
+        │
+        ├─ (opcional) tiny.detect_language → ¿cambiar locale?
+        ▼
+medium.transcribe(language=locale activo)
+        │  filtro no_speech / avg_logprob / longitud mínima
+        ▼
+[You]: "…"  →  LLM / tools / cierre
+```
+
+1. **Grabación** — `record_user_audio_vad` en [`assistant.py`](assistant.py): descarta silencio inicial, guarda un pre-roll corto (~0.3 s) para no cortar la primera sílaba, acumula frames mientras hay voz y corta tras ~1 s de silencio (`SILENCE_LIMIT_SEC`) o al tope de seguridad (`MAX_RECORD_SEC`).
+2. **Wake pegado** — si el comando viene justo tras “Hey Kimmi”, el ring buffer de la wake word se pasa como `seed_audio` y se continúa grabando; a veces no hay acuse TTS.
+3. **STT final** — `transcribe_for_turn`:
+   - Si `LANG_AUTO_DETECT_ENABLED`, el modelo `tiny` estima idioma (con histéresis / umbrales de duración y probabilidad).
+   - Whisper `medium` transcribe con `language` del locale (nunca `language=None` en el camino feliz), `beam_size=1`, `temperature=0.0`, sin `vad_filter` (Silero ya recortó).
+   - `initial_prompt` sesga nombres propios (p. ej. `USER_NAME`, apps de la allowlist).
+4. **Calidad** — segmentos con `no_speech_prob` alto o `avg_logprob` muy bajo se descartan; transcripts demasiado cortos marcan `ok=False` y Kimmi pide repetir.
+5. **Confirmaciones** — `_confirm_action` llama a `transcribe_audio` **directo** (sin auto-switch de idioma), para que un “sí/no” dudoso no vuelque la sesión a otro locale.
+
+Constantes útiles en [`assistant.py`](assistant.py): `WHISPER_MODEL_SIZE`, `WHISPER_BEAM_SIZE`, `LANG_*`, `SILENCE_LIMIT_SEC`, `VAD_PRE_ROLL_SEC`.
+
+### STT parcial (feature flag)
+
+Por defecto **apagado**. Actívalo solo para probar feedback en vivo y medir coste:
+
+```powershell
+$env:KIMMI_PARTIAL_STT = "1"
+python assistant.py
+```
+
+Apagar (baseline):
+
+```powershell
+Remove-Item Env:KIMMI_PARTIAL_STT -ErrorAction SilentlyContinue
+```
+
+También aparece en el banner `Flags: … PARTIAL_STT=True|False` al llegar a `KIMMI READY`.
+
+#### Qué hace
+
+Mientras `record_user_audio_vad` captura, un worker en background ([`partial_stt.py`](partial_stt.py)) reutiliza el Whisper **`tiny`** (el mismo de detección de idioma) bajo un lock:
+
+1. Cada chunk de voz se añade a un buffer PCM compartido (`feed`).
+2. Cada ~**800 ms** (`PARTIAL_STT_INTERVAL_MS`), si hay al menos ~**0.8 s** de audio (`PARTIAL_STT_MIN_AUDIO_SEC`) y no hay otra transcripción en curso, corre `tiny.transcribe` sobre una **copia** del buffer.
+3. Si el texto cambia, imprime una línea distinta del final:
+
+```text
+[You~]: open cursor please
+[You~]: open cursor in this project
+```
+
+4. Al cortar el VAD, el worker hace **`stop` + join** antes de devolver el PCM. Luego el camino normal (`medium`) produce el `[You]:` autoritativo.
+5. Resumen de coste: `[partial_stt]: calls=N total_ms=M`, y en la línea `[perf]` del turno: `partial_n` / `partial_ms` (junto a `stt`).
+
+```text
+Mic → VAD ──feed──► buffer PCM ──tick──► tiny → [You~]: …
+         │                                    (best-effort)
+         └─ silencio → stop worker → medium → [You]: … → LLM
+```
+
+#### Qué no hace
+
+- **No** sustituye el transcript final.
+- **No** arranca el LLM con el texto parcial (no hay prefetch).
+- **No** publica MQTT ni anima el HUD del desktop (el bridge sigue mirando `[You]:` / `[Kimmi]:`; `[You~]:` es inerte para el estado).
+- Si un tick tarda más que el intervalo, el siguiente se **salta** (no encola): el hilo de captura nunca espera a Whisper.
+
+#### A/B y contención de GPU
+
+Compara la misma frase con flag off/on mirando `[perf]`: `stt`, `ttfa`, `llm_ttft`, y con el flag on también `partial_n` / `partial_ms`. Si con el flag on el `stt` final sube mucho, es señal de pelea por la GPU entre `tiny` (parciales) y `medium` (final); el diseño actual prioriza aislamiento por lock + join, no un segundo modelo en VRAM.
+
+### Markers de stdout relacionados
+
+| Marker | Significado |
+|--------|-------------|
+| `[VAD]:` | Inicio/fin de habla o timeout de escucha |
+| `[You~]:` | Hipótesis parcial (solo con `KIMMI_PARTIAL_STT=1`) |
+| `[You]:` | Transcript final del turno |
+| `[partial_stt]:` | Resumen de llamadas / ms del worker parcial |
+| `[perf]` | Latencias del turno (`stt`, `partial_*`, …); inerte para el HUD |
+
+Detalle de latencia del pipeline de voz: [`ROADMAP.md`](ROADMAP.md).
 
 ---
 
@@ -395,6 +503,7 @@ Detalle completo en [Memoria de Kimmi](#memoria-de-kimmi). Resumen:
 ```text
 assistant.py          # Bucle: audio + chat/tools + jobs announce + TTS
 audio_out.py          # Sink, barge-in, streaming TTS
+partial_stt.py        # Rolling STT parcial (flag KIMMI_PARTIAL_STT)
 clip_cache.py         # Frases fijas pre-sintetizadas (acks, fillers)
 locale_config.py      # ES/EN: frases, regex de cierre, STT prompts
 mqtt_bus.py           # Publicación MQTT (pipeline / notify / jobs)
@@ -425,11 +534,12 @@ Roadmaps: [`ROADMAP.md`](ROADMAP.md) (voz/core), [`ROADMAP_2.md`](ROADMAP_2.md) 
 1. **Frases claras y una intención por turno** — el VAD corta al silencio; evita monólogos largos.
 2. **Nombres concretos** — contenedores, carpetas y apps (“Cursor”, no “el editor”) mejoran el function calling.
 3. **Sandbox** — fuera de `ALLOWED_DATA_ROOT`, Kimmi dirá que no puede.
-4. **GPU** — Whisper `medium` + CUDA/`float16`. Si falta VRAM, baja a `small` o CPU/`int8`.
+4. **GPU** — Whisper `medium` + CUDA/`float16`. Si falta VRAM, baja a `small` o CPU/`int8`. El `tiny` (idioma / parciales) ya está cargado en el boot.
 5. **Voz** — sin markdown a propósito (TTS). Si el 14B tarda, deberías oír un filler (“Déjame comprobarlo” / “Let me check that”).
 6. **Confirmación** — “sí” / “dale” o “no” / “cancelar”.
 7. **SearXNG** — sin él fallan web search, research y competencia (errores controlados, sin inventar).
 8. **Micrófono** — habla tras el acuse (si lo hay); buen audio ayuda mucho al STT.
+9. **STT parcial** — `KIMMI_PARTIAL_STT=1` para ver `[You~]:` mientras hablas; el LLM sigue usando solo el `[You]:` final.
 
 ---
 
