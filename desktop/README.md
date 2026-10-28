@@ -38,6 +38,10 @@ Startup order: **Mosquitto → MQTT client → engine subprocess**.
 
 A 200×200 window opens and animates the wave from pipeline status (`idle` / `listening` / `processing` / `responding`). A system-tray icon shows Windows toasts for `kimmi/notify` messages.
 
+A second window, **KIMMI · CHAT** ([`chat_window.py`](chat_window.py)), opens to its right: your messages and Kimmi's replies as bubbles, a small `ROUTER` line with the chosen intent, and a card for every tool call (arguments, status, duration and a collapsible result; errors open by themselves). It is fed only over MQTT (`kimmi/chat/*`, `kimmi/tools/call`), so it stays empty with `KIMMI_UI_BUS=stdout`. Closing it keeps Kimmi running: reopen it from the tray menu (**Show chat**).
+
+The window can be resized by dragging any edge or corner: it always stays square ([`aspect_lock.py`](aspect_lock.py)) and the wave, strokes and labels scale with it. Colors and fonts live in [`theme.py`](theme.py) (Orbitron + Rajdhani from `assets/fonts/`, SIL Open Font License); keep them in sync with `robot-vision/ui_theme.py`.
+
 Closing the window (or Quit from the tray menu) stops:
 
 1. MQTT desktop client  

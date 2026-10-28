@@ -27,7 +27,7 @@ ALLOWED_CATEGORIES = frozenset({
 _MIN_USER_CHARS = 20
 _MAX_FACTS = 2
 _EXTRACT_NUM_PREDICT = 120
-_DEFAULT_MODEL = "qwen2.5:3b"
+_DEFAULT_MODEL = "qwen2.5:7b"
 
 # Signals that the utterance might contain a durable fact (bilingual, cheap).
 _STABLE_SIGNAL_RE = re.compile(

@@ -23,7 +23,7 @@ def _env(name: str, default: str) -> str:
 
 
 class MqttBus:
-    """Publisher for kimmi/{pipeline,notify,tts,jobs} topics."""
+    """Publisher for kimmi/{pipeline,notify,tts,jobs,chat,tools} topics."""
 
     def __init__(
         self,
@@ -126,6 +126,55 @@ class MqttBus:
     def publish_tts_active(self, active: bool) -> None:
         payload = {"active": bool(active), "ts": time.time()}
         self._publish(f"{self.prefix}/tts/active", payload, qos=0, retain=True)
+
+    # --- Chat window (desktop/chat_window.py) ---
+
+    def publish_chat_message(self, role: str, text: str, turn_id: int) -> None:
+        """One line of the conversation: role is "user" or "assistant"."""
+        payload = {"role": role, "text": text, "turn_id": turn_id, "ts": time.time()}
+        self._publish(f"{self.prefix}/chat/message", payload, qos=1, retain=False)
+
+    def publish_intent(
+        self,
+        turn_id: int,
+        intent: str,
+        confidence: Optional[float] = None,
+        reason: str = "",
+    ) -> None:
+        """How the router classified the turn (shown as a small line in the chat)."""
+        payload: Dict[str, Any] = {
+            "turn_id": turn_id,
+            "intent": intent,
+            "reason": reason,
+            "ts": time.time(),
+        }
+        if confidence is not None:
+            payload["confidence"] = round(float(confidence), 2)
+        self._publish(f"{self.prefix}/chat/intent", payload, qos=1, retain=False)
+
+    def publish_tool_call(
+        self,
+        call_id: str,
+        turn_id: int,
+        name: str,
+        arguments: Dict[str, Any],
+        status: str,
+        result: str = "",
+        duration_ms: Optional[int] = None,
+    ) -> None:
+        """A tool call: status running -> done | error | cancelled (same call_id)."""
+        payload: Dict[str, Any] = {
+            "call_id": call_id,
+            "turn_id": turn_id,
+            "name": name,
+            "arguments": arguments,
+            "status": status,
+            "result": result,
+            "ts": time.time(),
+        }
+        if duration_ms is not None:
+            payload["duration_ms"] = duration_ms
+        self._publish(f"{self.prefix}/tools/call", payload, qos=1, retain=False)
 
     # --- Job stubs (Phase B callers) ---
 

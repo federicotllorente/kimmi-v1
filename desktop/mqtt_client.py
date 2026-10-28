@@ -1,4 +1,4 @@
-"""Qt-facing MQTT subscriber for Kimmi desktop (pipeline state + notify)."""
+"""Qt-facing MQTT subscriber for Kimmi desktop (pipeline state, notify, chat, tools)."""
 from __future__ import annotations
 
 import json
@@ -27,6 +27,10 @@ class MqttClient(QObject):
     notify_received = Signal(str, str, str)  # title, body, level
     tts_active_received = Signal(bool)
     connection_changed = Signal(bool)  # connected?
+    # Chat window: conversation lines, router decisions and tool calls
+    chat_message_received = Signal(str, str, int)  # role, text, turn_id
+    intent_received = Signal(dict)
+    tool_call_received = Signal(dict)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -111,6 +115,9 @@ class MqttClient(QObject):
             (f"{self.prefix}/tts/active", 0),
             (f"{self.prefix}/jobs/done", 1),
             (f"{self.prefix}/jobs/failed", 1),
+            (f"{self.prefix}/chat/message", 1),
+            (f"{self.prefix}/chat/intent", 1),
+            (f"{self.prefix}/tools/call", 1),
         ]
         for topic, qos in topics:
             client.subscribe(topic, qos=qos)
@@ -171,3 +178,13 @@ class MqttClient(QObject):
             self._emit_notify("Kimmi", body, level, key)
         elif topic.endswith("/tts/active"):
             self.tts_active_received.emit(bool(payload.get("active")))
+        elif topic.endswith("/chat/message"):
+            role = str(payload.get("role") or "")
+            text = str(payload.get("text") or "")
+            if role and text:
+                self.chat_message_received.emit(role, text, int(payload.get("turn_id") or 0))
+        elif topic.endswith("/chat/intent"):
+            self.intent_received.emit(dict(payload))
+        elif topic.endswith("/tools/call"):
+            if payload.get("call_id"):
+                self.tool_call_received.emit(dict(payload))

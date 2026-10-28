@@ -43,12 +43,15 @@ from tools.intent import (
     INTENT_CONFIDENCE_THRESHOLD,
     classify_intent,
     confirmation_prompt,
+    history_expects_tool_followup,
+    looks_like_small_talk,
     parse_yes_no,
     previous_user_fact,
     should_force_memory_save,
     tool_needs_confirmation,
 )
 from tools.registry import build_system_prompt, build_tools, format_memory_block, tools_for_intent
+from tools.tool_calls import request_tool_call
 from tools.memory import memory_db
 from tools.soft_memory import (
     mark_memory_written_this_turn,
@@ -163,24 +166,32 @@ PARTIAL_STT_MIN_AUDIO_SEC = 0.8
 FILLER_ENABLED = True
 FILLER_AFTER_MS = 1200
 
-# Modelo ligero: clasificar intención + charla sin tools.
-FAST_MODEL = "qwen2.5:3b"
-# Modelo pesado: solo function calling y resumen tras tools.
-LLM_MODEL = "qwen2.5:14b"
+# One model for everything (intent, chat, tools). On an 8 GB GPU the 14B did not
+# fit (38% ran on CPU, ~40 s per tools turn) and loading it evicted the 3B.
+# The 7B (4.8 GB) runs 100% on the GPU and calls tools reliably.
+# Two names kept so each role can be changed independently later.
+FAST_MODEL = "qwen2.5:7b"
+LLM_MODEL = "qwen2.5:7b"
 
 # num_ctx explícito evita que Ollama redecida el contexto en cada request.
 # num_predict acota la respuesta: es voz, no un ensayo.
+# 4096 = Ollama's default, used by every call that sets no num_ctx (intent,
+# soft memory, docs, research). A different value would force a model reload.
 LLM_CHAT_OPTIONS = {
-    "num_ctx": 2048,
+    "num_ctx": 4096,
     "num_predict": 96,
     "temperature": 0.6,
     "top_k": 20,
 }
 
-# STT: medium es más preciso que small (cuesta algo más de latencia en GPU).
+# STT: measured with tests/eval_stt.py (16 Kokoro phrases, ES + EN):
+#   medium: WER 9.5%,  215 ms, 1747 MB VRAM
+#   small:  WER 11.0%, 103 ms,  583 MB VRAM
+# small frees ~1.1 GB next to the 7B on an 8 GB GPU. Re-check with your own
+# recordings in tests/audio/ before trusting it for real speech.
 # WHISPER_MODEL_SIZE = "tiny"
-# WHISPER_MODEL_SIZE = "small"
-WHISPER_MODEL_SIZE = "medium"
+# WHISPER_MODEL_SIZE = "medium"
+WHISPER_MODEL_SIZE = "small"
 # beam 1: con temperature 0.0 el beam search apenas cambia el resultado y
 # cuesta bastante latencia. best_of solo aplica con muestreo, así que va a 1.
 WHISPER_BEAM_SIZE = 1
@@ -873,6 +884,68 @@ def publish_tts(active: bool) -> None:
         print(f"[MQTT]: publish_tts_active failed ({exc})", flush=True)
 
 
+# --- Events for the desktop chat window -------------------------------------
+# Number of the current exchange: groups the user message, the intent, the
+# tool calls and the reply of one turn in the chat window.
+_chat_turn_id = 0
+
+# Tool results can be long (file contents, web pages): the card shows a preview
+TOOL_RESULT_PREVIEW_CHARS = 2000
+
+
+def start_chat_turn(user_text: str) -> None:
+    global _chat_turn_id
+    _chat_turn_id += 1
+    publish_chat("user", user_text)
+
+
+def publish_chat(role: str, text: str) -> None:
+    try:
+        mqtt_bus.publish_chat_message(role, text, _chat_turn_id)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[MQTT]: publish_chat_message failed ({exc})", flush=True)
+
+
+def publish_intent(intent: str, confidence: Optional[float] = None, reason: str = "") -> None:
+    try:
+        mqtt_bus.publish_intent(_chat_turn_id, intent, confidence, reason)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[MQTT]: publish_intent failed ({exc})", flush=True)
+
+
+def publish_tool(
+    call_id: str,
+    name: str,
+    arguments: Dict[str, Any],
+    status: str,
+    result: str = "",
+    duration_ms: Optional[int] = None,
+) -> None:
+    try:
+        mqtt_bus.publish_tool_call(
+            call_id,
+            _chat_turn_id,
+            name,
+            arguments,
+            status,
+            result[:TOOL_RESULT_PREVIEW_CHARS],
+            duration_ms,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[MQTT]: publish_tool_call failed ({exc})", flush=True)
+
+
+def _tool_result_failed(result: str) -> bool:
+    """Exceptions, and tools that answer with JSON like {"error": ...}."""
+    if result.startswith(("Error de argumentos", "Error al ejecutar")):
+        return True
+    try:
+        data = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(data, dict) and bool(data.get("error"))
+
+
 def speak_text(text: str, allow_barge_in: bool = True) -> bool:
     """Reproduce texto por TTS (bloqueante hasta que termina el audio).
 
@@ -958,27 +1031,6 @@ _TOOLISH_RE = re.compile(
     r")\b"
 )
 
-_PROVIDER_FOLLOWUP_RE = re.compile(
-    r"(?i)("
-    r"\blocal\b|\bclaude\b|\bchatgpt\b|\bollama\b|\bprovider\b"
-    r"|\banthropic\b|\bopenai\b"
-    r"|quieres?\s+que\s+lo\s+recuerde"
-    r"|want\s+me\s+to\s+remember"
-    r"|should\s+i\s+remember"
-    r")",
-)
-
-
-def _history_expects_tool_followup(history: List[Dict[str, Any]]) -> bool:
-    """True si el último mensaje de Kimmi espera provider / confirmación de tool."""
-    for msg in reversed(history or []):
-        if msg.get("role") != "assistant":
-            continue
-        content = str(msg.get("content") or "")
-        return bool(_PROVIDER_FOLLOWUP_RE.search(content))
-    return False
-
-
 def looks_like_chat_only(
     text: str,
     history: Optional[List[Dict[str, Any]]] = None,
@@ -992,7 +1044,7 @@ def looks_like_chat_only(
     cleaned = (text or "").strip()
     if not cleaned:
         return False
-    if _history_expects_tool_followup(history or []):
+    if history_expects_tool_followup(history or []):
         return False
     if _TOOLISH_RE.search(cleaned):
         return False
@@ -1486,8 +1538,8 @@ def _run_tools_turn(
 ) -> str:
     """Una llamada con tools (modelo pesado) + confirmación + resumen."""
     print(f"  [LLM]: using {LLM_MODEL} with tools...")
-    # El 14B va sin stream y solo habla al terminar: aquí ya sabemos que va a
-    # tardar, así que el aviso es inmediato y no espera al timer.
+    # The tools call runs without streaming and only speaks at the end, so the
+    # filler plays right away instead of waiting for the timer.
     _enqueue_filler(current_locale().filler_tools)
     # Si el clip falló (caché fría), el timer de chat cubre el hueco cuando
     # haya respuesta directa; mientras tanto rearmamos un timer corto.
@@ -1495,11 +1547,8 @@ def _run_tools_turn(
     if not _filler_played.is_set():
         filler_timer = arm_filler()
     try:
-        response = ollama.chat(
-            model=LLM_MODEL,
-            messages=messages,
-            tools=tools,
-            keep_alive="24h",
+        response = request_tool_call(
+            messages, tools, LLM_MODEL, LLM_CHAT_OPTIONS["num_ctx"]
         )
     finally:
         if filler_timer is not None:
@@ -1527,23 +1576,39 @@ def _run_tools_turn(
         except json.JSONDecodeError:
             fn_args = {}
 
+    call_id = f"{_chat_turn_id}-{fn_name}-{time.monotonic_ns()}"
+
     if fn_name not in available_tools:
+        publish_tool(call_id, fn_name, fn_args, "error", "Tool not available")
         final = current_locale().spoken["tool_unavailable"]
         speak_text(final)
         return final
 
     if tool_needs_confirmation(fn_name, fn_args):
         if not _confirm_action(mic_stream, fn_name, fn_args):
+            publish_tool(call_id, fn_name, fn_args, "cancelled", "The user did not confirm")
             return current_locale().spoken["cancelled"]
 
     print(f"\n[Running]: {fn_name}")
     publish_pipeline("processing", f"tool {fn_name}")
+    publish_tool(call_id, fn_name, fn_args, "running")
+    started = time.monotonic()
     try:
         tool_result = available_tools[fn_name](**fn_args)
     except TypeError as exc:
         tool_result = f"Error de argumentos en {fn_name}: {exc}"
     except Exception as exc:  # noqa: BLE001
         tool_result = f"Error al ejecutar {fn_name}: {exc}"
+
+    result_text = str(tool_result)
+    publish_tool(
+        call_id,
+        fn_name,
+        fn_args,
+        "error" if _tool_result_failed(result_text) else "done",
+        result_text,
+        int((time.monotonic() - started) * 1000),
+    )
 
     if fn_name == "remember_fact" and str(tool_result).startswith("Recuerdo guardado"):
         mark_memory_written_this_turn()
@@ -1571,6 +1636,7 @@ def handle_user_turn(
     # Explicit language switch: pre-baked ack in the NEW language, no LLM.
     target = match_language_switch(user_text)
     if target is not None:
+        publish_intent("language", reason=f"switch to {target}")
         loc = current_locale()
         if loc.code == target:
             print(f"  [Locale]: already {loc.code} (command)")
@@ -1586,6 +1652,7 @@ def handle_user_turn(
     # Cierre conversacional: no LLM, no "¿necesitas algo más?"
     if is_conversation_closing(user_text):
         print("  [Closing]: goodbye/thanks detected")
+        publish_intent("closing", reason="goodbye/thanks detected")
         return speak_closing_ack()
 
     # RAG: recuperar recuerdos relevantes antes de llamar al LLM.
@@ -1632,7 +1699,14 @@ def handle_user_turn(
     if force_memory:
         subset = tools_for_intent("memory", tools_schema)
         if subset:
+            publish_intent("memory", reason="confirmed a memory offer")
             return _run_tools_turn(messages, subset, mic_stream)
+
+    # Obvious small talk ("can you hear me?", "hi"): skip the classifier call.
+    if looks_like_small_talk(effective_user_text, history):
+        print("  [Intent]: small talk → fast model, no classifier")
+        publish_intent("chat", reason="small talk shortcut (no classifier)")
+        return _chat_reply(messages, FAST_MODEL)
 
     print(f"  [Intent]: classifying with {FAST_MODEL}...")
     intent_result = classify_intent(
@@ -1644,12 +1718,14 @@ def handle_user_turn(
         f"  [Intent]: {intent_result.intent} "
         f"(conf={intent_result.confidence:.2f}) — {intent_result.brief_reason}"
     )
+    publish_intent(intent_result.intent, intent_result.confidence, intent_result.brief_reason)
 
+    # Unclear or low confidence: let the LLM answer WITHOUT tools instead of a
+    # fixed sentence. It sees the context, and can ask for clarification itself.
     low_confidence = intent_result.confidence < INTENT_CONFIDENCE_THRESHOLD
     if intent_result.intent == "clarify" or low_confidence:
-        final = current_locale().spoken["unclear_request"]
-        speak_text(final)
-        return final
+        print("  [Intent]: unclear → fast model, no tools")
+        return _chat_reply(messages, FAST_MODEL)
 
     use_tools = ENABLE_TOOLS and intent_result.should_use_tools
     if not use_tools:
@@ -1766,11 +1842,13 @@ def run_conversation_session(
             lang_switch = match_language_switch(user_text) is not None
             # Limpia captura previa por si acaso; speak_text/_chat_reply la rellenan.
             take_barge_in_audio()
+            start_chat_turn(user_text)
             assistant_text = handle_user_turn(
                 user_text,
                 conversation_history,
                 mic_stream,
             )
+            publish_chat("assistant", assistant_text)
             perf.finish_turn()
 
             conversation_history.append({"role": "user", "content": user_text})
@@ -1853,13 +1931,14 @@ def warmup() -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"  [Warmup]: Ollama {FAST_MODEL} did not answer ({exc})")
 
-    if ENABLE_TOOLS:
+    # Skip when both roles use the same model: it is already loaded.
+    if ENABLE_TOOLS and LLM_MODEL != FAST_MODEL:
         try:
             ollama.chat(
                 model=LLM_MODEL,
                 messages=[{"role": "user", "content": "hi"}],
                 keep_alive="24h",
-                options={"num_predict": 1},
+                options={"num_predict": 1, "num_ctx": LLM_CHAT_OPTIONS["num_ctx"]},
             )
         except Exception as exc:  # noqa: BLE001
             print(f"  [Warmup]: Ollama {LLM_MODEL} did not answer ({exc})")

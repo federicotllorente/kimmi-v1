@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QAction, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -13,13 +13,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import theme
+from aspect_lock import handle_sizing
 from bridge import EngineBridge, ui_bus_mode
+from chat_window import ChatWindow
 from mosquitto_supervisor import MosquittoSupervisor
 from mqtt_client import MqttClient
 from wave_gl import WaveGLWidget
 
 
+# Initial size; the window can be resized but always stays square, and the
+# wave scales with it (see aspect_lock.py and WaveGLWidget)
 WINDOW_SIZE = 200
+MIN_WINDOW_SIZE = 140
+WINDOW_ASPECT = 1.0
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 ICON_PATH = ASSETS_DIR / "kimmi.png"
 
@@ -33,10 +40,10 @@ def _ensure_icon() -> QIcon:
     pix.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pix)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setBrush(QColor("#2EC4B6"))
+    painter.setBrush(theme.TEAL)
     painter.setPen(Qt.PenStyle.NoPen)
     painter.drawEllipse(4, 4, 56, 56)
-    painter.setBrush(QColor("#0B132B"))
+    painter.setBrush(theme.DEEP)
     painter.drawEllipse(22, 22, 20, 20)
     painter.end()
     pix.save(str(ICON_PATH), "PNG")
@@ -47,7 +54,8 @@ class KimmiWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("KIMMI")
-        self.setFixedSize(WINDOW_SIZE, WINDOW_SIZE)
+        self.resize(WINDOW_SIZE, WINDOW_SIZE)
+        self.setMinimumSize(MIN_WINDOW_SIZE, MIN_WINDOW_SIZE)
         self.setWindowFlags(
             self.windowFlags()
             | Qt.WindowType.WindowStaysOnTopHint
@@ -75,22 +83,47 @@ class KimmiWindow(QMainWindow):
         self.mqtt.tts_active_received.connect(self.bridge.apply_tts_active)
         self.mqtt.connection_changed.connect(self.bridge.set_mqtt_connected)
 
+        # Second window: conversation + tool cards (only fed over MQTT)
+        self.chat = ChatWindow()
         self._icon = _ensure_icon()
+        self.chat.setWindowIcon(self._icon)
+        self.mqtt.chat_message_received.connect(self.chat.add_message)
+        self.mqtt.intent_received.connect(self.chat.add_intent)
+        self.mqtt.tool_call_received.connect(self.chat.update_tool)
+        self.mqtt.connection_changed.connect(self.chat.set_connected)
+        self.bridge.status_updated.connect(self.chat.set_status)
+        self._chat_placed = False
+
         self.setWindowIcon(self._icon)
         self.tray = QSystemTrayIcon(self._icon, self)
         self.tray.setToolTip("Kimmi")
+        chat_action = QAction("Show chat", self)
+        chat_action.triggered.connect(self.show_chat)
         quit_action = QAction("Quit Kimmi", self)
         quit_action.triggered.connect(self.close)
         from PySide6.QtWidgets import QMenu
 
         menu = QMenu(self)
+        menu.addAction(chat_action)
         menu.addAction(quit_action)
         self.tray.setContextMenu(menu)
         self.tray.show()
 
+    def show_chat(self) -> None:
+        if not self._chat_placed:
+            # First time: open it just to the right of the wave window
+            frame = self.frameGeometry()
+            self.chat.move(frame.right() + 12, frame.top())
+            self._chat_placed = True
+        self.chat.show()
+        self.chat.raise_()
+        self.chat.activateWindow()
+
     def start_services(self) -> None:
         mode = ui_bus_mode()
         need_mqtt = mode in ("mqtt", "dual")
+        if not need_mqtt:
+            self.chat.set_connected(False)
 
         if need_mqtt:
             ok, message = self.mosquitto.start()
@@ -110,6 +143,14 @@ class KimmiWindow(QMainWindow):
 
         self.bridge.start()
 
+    def nativeEvent(self, event_type, message):  # noqa: N802
+        # Keep the window square while the user drags an edge or corner
+        if event_type == b"windows_generic_MSG":
+            min_width = int(MIN_WINDOW_SIZE * self.devicePixelRatioF())
+            if handle_sizing(int(message), WINDOW_ASPECT, min_width):
+                return True, 1
+        return super().nativeEvent(event_type, message)
+
     def _on_notify(self, title: str, body: str, level: str) -> None:
         icon = QSystemTrayIcon.MessageIcon.Information
         if level in ("error", "critical"):
@@ -119,7 +160,11 @@ class KimmiWindow(QMainWindow):
         self.tray.showMessage(title or "Kimmi", body or "", icon, 8000)
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        # Order: MQTT client → engine → mosquitto child → tray (§0.1 / Fase A plan).
+        # Order: chat window → MQTT client → engine → mosquitto child → tray (§0.1 / Fase A plan).
+        try:
+            self.chat.close()
+        except Exception:  # noqa: BLE001
+            pass
         try:
             self.mqtt.stop()
         except Exception:  # noqa: BLE001
@@ -142,12 +187,14 @@ class KimmiWindow(QMainWindow):
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("KIMMI")
+    theme.load_fonts()
     # Keep running if the window is hidden but tray is visible (optional later).
     app.setQuitOnLastWindowClosed(True)
 
     window = KimmiWindow()
     window.start_services()
     window.show()
+    window.show_chat()
     return app.exec()
 
 

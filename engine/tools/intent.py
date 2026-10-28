@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Set
 
 import ollama
 
-from locale_config import current_locale
+from locale_config import LOCALES, current_locale
 
 # Intents válidos y tools asociadas (subconjunto del schema completo).
 INTENT_TOOL_MAP: Dict[str, List[str]] = {
@@ -36,6 +36,7 @@ INTENT_TOOL_MAP: Dict[str, List[str]] = {
         "list_jobs",
     ],
     "memory": ["remember_fact"],
+    "vision": ["describe_scene", "find_object"],
 }
 
 VALID_INTENTS: Set[str] = set(INTENT_TOOL_MAP.keys())
@@ -64,20 +65,24 @@ ALWAYS_CONFIRM_TOOLS = frozenset({
 
 _CLASSIFY_SYSTEM = (
     "You are an intent classifier for a voice assistant named Kimmi. "
+    "The text is a speech transcript that is already clean: never judge audio quality. "
     "Reply ONLY with valid JSON, no markdown and no extra text. "
     "Schema: {\"intent\": string, \"confidence\": number, \"brief_reason\": string}. "
-    "intent must be exactly one of: chat, apps, files, code, docker, clipboard, calc, docs, web, jobs, research, competition, memory, clarify. "
+    "intent must be exactly one of: chat, apps, files, code, docker, clipboard, calc, docs, web, jobs, research, competition, memory, vision, clarify. "
     "Rules: "
-    "chat = greeting, small talk, general question with no action on the PC "
-    "(including asking about something that should already be in memory, without asking to save it); "
-    "apps = open or focus an application; "
+    "chat = greeting, small talk, checking that Kimmi is there or can hear you, questions "
+    "about Kimmi, general knowledge or explanations Kimmi can answer by itself, with no "
+    "action on the PC (including asking about something that should already be in memory, "
+    "without asking to save it); "
+    "apps = open or focus an application (including the browser); "
     "files = list, read or write files and folders; "
     "code = search code, scaffold, or the Cursor agent; "
-    "docker = containers or compose; "
+    "docker = containers or compose (start, stop, restart, logs of a container); "
     "clipboard = the clipboard; "
     "calc = calculations or numeric conversions; "
     "docs = allowlisted library/API documentation pages; "
-    "web = live web search for current facts (weather, news, prices, who/what); "
+    "web = live web search for facts that change over time (weather, news, prices, "
+    "recent events); stable general knowledge is chat; "
     "jobs = start/check/read a demo or generic background job; "
     "research = investigate or research a topic in depth and produce a summary "
     "(including choosing local vs Claude/ChatGPT); "
@@ -85,10 +90,48 @@ _CLASSIFY_SYSTEM = (
     "(including choosing local vs Claude/ChatGPT); "
     "memory = the user EXPLICITLY asks to remember, note down or save something to memory "
     "(remember that..., note..., save that...); "
-    "clarify = the audio is ambiguous, incomplete or unintelligible. "
-    "confidence between 0 and 1. When unsure, use clarify with low confidence. "
-    "The user may speak any language; classify the intent regardless."
+    "vision = what the robot camera sees, what is on the table, where an object is, "
+    "or whether an object is in view; "
+    "clarify = ONLY when the text is gibberish or cut off mid-sentence so there is no "
+    "request at all. "
+    "confidence between 0 and 1. When unsure, use chat: a wrong chat is harmless. "
+    "The user may speak any language; classify the intent regardless. "
+    "Examples: "
+    "\"Can you hear me?\" -> chat. "
+    "\"¿Me escuchas?\" -> chat. "
+    "\"Hola Kimmi, ¿qué tal?\" -> chat. "
+    "\"Explain how a servo motor works\" -> chat. "
+    "\"What is the capital of France?\" -> chat. "
+    "\"Abre Visual Studio Code\" -> apps. "
+    "\"Open the browser\" -> apps. "
+    "\"¿Qué tiempo hace mañana en Sevilla?\" -> web. "
+    "\"How much is 12 times 37?\" -> calc. "
+    "\"Remember that my router IP is 10.0.0.1\" -> memory. "
+    "\"Para el contenedor de redis\" -> docker. "
+    "\"¿Qué ves?\" -> vision. "
+    "\"Where is the blue cup?\" -> vision. "
+    "\"y entonces el...\" -> clarify."
 )
+
+# Ollama structured output: the model can only produce one of the valid intents.
+_CLASSIFY_FORMAT: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "intent": {"type": "string", "enum": sorted(VALID_INTENTS)},
+        "confidence": {"type": "number"},
+        "brief_reason": {"type": "string"},
+    },
+    "required": ["intent", "confidence", "brief_reason"],
+}
+
+# Fixed sentences Kimmi says without the LLM ("I'm not sure what you asked", ...).
+# They carry no meaning, and keeping them in the classifier context made it
+# repeat its own clarify decision turn after turn.
+_CANNED_REPLIES: Set[str] = {
+    text.strip()
+    for loc in LOCALES.values()
+    for text in loc.spoken.values()
+}
 
 
 @dataclass(frozen=True)
@@ -153,8 +196,12 @@ def classify_intent(
         # Últimos turnos user/assistant como pista (sin system duplicado).
         for msg in recent_context[-4:]:
             role = msg.get("role")
-            if role in ("user", "assistant") and msg.get("content"):
-                messages.append({"role": role, "content": str(msg["content"])[:500]})
+            content = str(msg.get("content") or "").strip()
+            if role not in ("user", "assistant") or not content:
+                continue
+            if role == "assistant" and content in _CANNED_REPLIES:
+                continue
+            messages.append({"role": role, "content": content[:500]})
 
     messages.append({"role": "user", "content": user_text})
 
@@ -162,9 +209,10 @@ def classify_intent(
         model=model,
         messages=messages,
         keep_alive="24h",
+        format=_CLASSIFY_FORMAT,
         options={
             "temperature": 0.1,
-            "num_predict": 80,  # JSON corto; evita generar de más
+            "num_predict": 120,  # Short JSON; a cut-off reply would fall back to clarify
         },
     )
     content = response.get("message", {}).get("content", "")
@@ -237,6 +285,62 @@ def parse_yes_no(transcript: str) -> Optional[bool]:
         # "sí no" raro → indeterminado
         return None
     return None
+
+
+_PROVIDER_FOLLOWUP_RE = re.compile(
+    r"(?i)("
+    r"\blocal\b|\bclaude\b|\bchatgpt\b|\bollama\b|\bprovider\b"
+    r"|\banthropic\b|\bopenai\b"
+    r"|quieres?\s+que\s+lo\s+recuerde"
+    r"|want\s+me\s+to\s+remember"
+    r"|should\s+i\s+remember"
+    r")",
+)
+
+
+def history_expects_tool_followup(history: List[Dict[str, Any]]) -> bool:
+    """True si el último mensaje de Kimmi espera provider / confirmación de tool."""
+    for msg in reversed(history or []):
+        if msg.get("role") != "assistant":
+            continue
+        content = str(msg.get("content") or "")
+        return bool(_PROVIDER_FOLLOWUP_RE.search(content))
+    return False
+
+
+# "Can you hear me?", "are you there?", "¿me escuchas?", "¿estás ahí?"...
+_PRESENCE_CHECK_RE = re.compile(
+    r"(?i)^(?:hey\s+|hola\s+)?(?:kimmi\W*)?(?:"
+    r"(?:can|do)\s+you\s+(?:hear|understand)\s+me"
+    r"|are\s+you\s+(?:there|listening|awake|ok)"
+    r"|(?:me\s+)?(?:escuchas|oyes|entiendes)"
+    r"|est[aá]s\s+(?:ah[ií]|despierta|escuchando)"
+    r")(?:\s+(?:me|now|kimmi|ahora|bien))*$"
+)
+
+
+def looks_like_small_talk(
+    text: str,
+    history: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    """Strict check used before the intent classifier.
+
+    Unlike assistant.looks_like_chat_only (any short phrase without an action
+    verb), this only accepts greetings, acks and "can you hear me?" checks, so
+    short tool requests such as "¿hay una taza?" still reach the classifier.
+    """
+    if history_expects_tool_followup(history or []):
+        return False
+
+    normalized = (text or "").strip().lower()
+    normalized = re.sub(r"^[¿¡\s]+", "", normalized)
+    normalized = re.sub(r"[\s\.\!\?\,;:]+$", "", normalized)
+    if not normalized:
+        return False
+
+    if current_locale().rag_skip_re.match(normalized):
+        return True
+    return bool(_PRESENCE_CHECK_RE.match(normalized))
 
 
 def last_assistant_offered_memory(history: Optional[List[Dict[str, Any]]]) -> bool:

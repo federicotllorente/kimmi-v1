@@ -36,8 +36,8 @@ python -m pip install -r requirements.txt
 |-------|-----|
 | **openWakeWord** | Detecta la wake word (`hey_kee_me`) |
 | **Silero VAD** | Fin de turno / barge-in |
-| **faster-whisper** (`medium` + `tiny`) | STT final; idioma + parciales opcionales — ver [Speech-to-text](#speech-to-text-stt) |
-| **Ollama** (`qwen2.5:3b` + `qwen2.5:14b`) | Chat rápido; 14B para tools / resumen post-tool |
+| **faster-whisper** (`small` + `tiny`) | STT final; idioma + parciales opcionales — ver [Speech-to-text](#speech-to-text-stt) |
+| **Ollama** (`qwen2.5:7b`) | Un solo modelo para intent, chat y tools (cabe entero en una GPU de 8 GB) |
 | **Kokoro ONNX** (o Piper) | Text-to-speech ES/EN |
 | **MQTT** (`mqtt_bus.py`) | Estados del pipeline + toasts (desktop) |
 | **JobManager** (`jobs.py`) | Tareas largas en background + avisos |
@@ -53,8 +53,7 @@ python -m pip install -r requirements.txt
 - [Ollama](https://ollama.com) en marcha, con:
 
 ```bash
-ollama pull qwen2.5:3b
-ollama pull qwen2.5:14b
+ollama pull qwen2.5:7b
 ```
 
 Opcional pero recomendado:
@@ -137,6 +136,9 @@ El desktop puede levantar Mosquitto y suscribirse a:
 - `kimmi/notify` — toast de Windows
 - `kimmi/tts/active` — refuerzo de animación
 - `kimmi/jobs/done` / `kimmi/jobs/failed` — toast de jobs (dedupe con notify)
+- `kimmi/chat/message` — `{role: user|assistant, text, turn_id}`: burbujas de la ventana de chat
+- `kimmi/chat/intent` — `{intent, confidence?, reason, turn_id}`: qué decidió el router
+- `kimmi/tools/call` — `{call_id, name, arguments, status: running|done|error|cancelled, result, duration_ms?}`: tarjetas de tools (el mismo `call_id` actualiza la tarjeta)
 
 El engine publica desde [`mqtt_bus.py`](mqtt_bus.py). Al cerrar el desktop: MQTT → engine → Mosquitto **solo si** Kimmi lo spawneó (si el puerto ya estaba ocupado, no lo mata). Detalles en [`../desktop/README.md`](../desktop/README.md).
 
@@ -152,7 +154,7 @@ El engine publica desde [`mqtt_bus.py`](mqtt_bus.py). Al cerrar el desktop: MQTT
 
 1. *“Investiga sobre X y haz un resumen”* → pregunta **local / Claude / ChatGPT**.
 2. `start_research(topic, provider)` encola un job: SearXNG + fetch de páginas públicas + síntesis.
-   - `local` → Ollama (`KIMMI_RESEARCH_MODEL` o `qwen2.5:14b`)
+   - `local` → Ollama (`KIMMI_RESEARCH_MODEL` o `qwen2.5:7b`)
    - `claude` → `ANTHROPIC_API_KEY`
    - `chatgpt` → `OPENAI_API_KEY`
 3. Retrieval **siempre** por SearXNG (cloud solo sintetiza).
@@ -177,7 +179,7 @@ En [`assistant.py`](assistant.py) puedes ajustar:
 - `ENABLE_TOOLS` — function calling (`True` por defecto)
 - `ENABLE_DEMO_JOBS` — job demo
 - `FILLER_ENABLED` / `FILLER_AFTER_MS` — relleno hablado si el turno tarda (inmediato en camino tools)
-- `FAST_MODEL` / `LLM_MODEL` — `qwen2.5:3b` / `qwen2.5:14b`
+- `FAST_MODEL` / `LLM_MODEL` — ambos `qwen2.5:7b`
 - `BARGE_IN_ENABLED` — cortar TTS hablando
 - `LANG_AUTO_DETECT_ENABLED` — cambio ES↔EN automático
 - `TTS_ENGINE` — `kokoro` o `piper`
@@ -234,14 +236,14 @@ Memoria permanente (ChromaDB) → `memory/` (gitignored salvo `.gitkeep`).
 
 ## Speech-to-text (STT)
 
-Kimmi no transcribe en streaming de punta a punta: **primero corta el turno con VAD**, y **después** pasa el PCM a Whisper. El texto que llega al LLM es siempre el del STT **final** (`medium`). Opcionalmente, con un feature flag, puede emitir hipótesis parciales **mientras** grabas (solo feedback / métricas; no alimentan el LLM).
+Kimmi no transcribe en streaming de punta a punta: **primero corta el turno con VAD**, y **después** pasa el PCM a Whisper. El texto que llega al LLM es siempre el del STT **final** (`small`). Opcionalmente, con un feature flag, puede emitir hipótesis parciales **mientras** grabas (solo feedback / métricas; no alimentan el LLM).
 
 ### Piezas
 
 | Pieza | Rol |
 |-------|-----|
 | Silero VAD | Decide cuándo empieza y termina la frase (`record_user_audio_vad`) |
-| faster-whisper `medium` | Transcript autoritativo del turno (`transcribe_audio` / `transcribe_for_turn`) |
+| faster-whisper `small` | Transcript autoritativo del turno (`transcribe_audio` / `transcribe_for_turn`) |
 | faster-whisper `tiny` | Detección de idioma (~15 ms) y, si el flag está on, STT parcial rolling |
 | Locale (`locale_config`) | Idioma fijo para Whisper (`es` / `en`), `initial_prompt` con nombre y apps |
 
@@ -257,7 +259,7 @@ PCM completo del turno
         │
         ├─ (opcional) tiny.detect_language → ¿cambiar locale?
         ▼
-medium.transcribe(language=locale activo)
+small.transcribe(language=locale activo)
         │  filtro no_speech / avg_logprob / longitud mínima
         ▼
 [You]: "…"  →  LLM / tools / cierre
@@ -267,7 +269,7 @@ medium.transcribe(language=locale activo)
 2. **Wake pegado** — si el comando viene justo tras “Hey Kimmi”, el ring buffer de la wake word se pasa como `seed_audio` y se continúa grabando; a veces no hay acuse TTS.
 3. **STT final** — `transcribe_for_turn`:
    - Si `LANG_AUTO_DETECT_ENABLED`, el modelo `tiny` estima idioma (con histéresis / umbrales de duración y probabilidad).
-   - Whisper `medium` transcribe con `language` del locale (nunca `language=None` en el camino feliz), `beam_size=1`, `temperature=0.0`, sin `vad_filter` (Silero ya recortó).
+   - Whisper `small` transcribe con `language` del locale (nunca `language=None` en el camino feliz), `beam_size=1`, `temperature=0.0`, sin `vad_filter` (Silero ya recortó).
    - `initial_prompt` sesga nombres propios (p. ej. `USER_NAME`, apps de la allowlist).
 4. **Calidad** — segmentos con `no_speech_prob` alto o `avg_logprob` muy bajo se descartan; transcripts demasiado cortos marcan `ok=False` y Kimmi pide repetir.
 5. **Confirmaciones** — `_confirm_action` llama a `transcribe_audio` **directo** (sin auto-switch de idioma), para que un “sí/no” dudoso no vuelque la sesión a otro locale.
@@ -304,13 +306,13 @@ Mientras `record_user_audio_vad` captura, un worker en background ([`partial_stt
 [You~]: open cursor in this project
 ```
 
-4. Al cortar el VAD, el worker hace **`stop` + join** antes de devolver el PCM. Luego el camino normal (`medium`) produce el `[You]:` autoritativo.
+4. Al cortar el VAD, el worker hace **`stop` + join** antes de devolver el PCM. Luego el camino normal (`small`) produce el `[You]:` autoritativo.
 5. Resumen de coste: `[partial_stt]: calls=N total_ms=M`, y en la línea `[perf]` del turno: `partial_n` / `partial_ms` (junto a `stt`).
 
 ```text
 Mic → VAD ──feed──► buffer PCM ──tick──► tiny → [You~]: …
          │                                    (best-effort)
-         └─ silencio → stop worker → medium → [You]: … → LLM
+         └─ silencio → stop worker → small → [You]: … → LLM
 ```
 
 #### Qué no hace
@@ -322,7 +324,7 @@ Mic → VAD ──feed──► buffer PCM ──tick──► tiny → [You~]: 
 
 #### A/B y contención de GPU
 
-Compara la misma frase con flag off/on mirando `[perf]`: `stt`, `ttfa`, `llm_ttft`, y con el flag on también `partial_n` / `partial_ms`. Si con el flag on el `stt` final sube mucho, es señal de pelea por la GPU entre `tiny` (parciales) y `medium` (final); el diseño actual prioriza aislamiento por lock + join, no un segundo modelo en VRAM.
+Compara la misma frase con flag off/on mirando `[perf]`: `stt`, `ttfa`, `llm_ttft`, y con el flag on también `partial_n` / `partial_ms`. Si con el flag on el `stt` final sube mucho, es señal de pelea por la GPU entre `tiny` (parciales) y `small` (final); el diseño actual prioriza aislamiento por lock + join, no un segundo modelo en VRAM.
 
 ### Markers de stdout relacionados
 
@@ -392,7 +394,7 @@ Usuario menciona un hecho
 Tras el turno (TTS ya sonó), un worker de **1 hilo** (`ThreadPoolExecutor`, no el `JobManager`) puede guardar en silencio:
 
 1. **Gate** (sin LLM): texto corto (menos de ~20 chars), cierre/saludo, secreto detectado, o sin señales de dato estable (IP, “mi/my”, preferencias, hardware, números…) → no hace nada.
-2. **Extractor:** `qwen2.5:3b` devuelve JSON con 0–2 hechos; solo parafrasea al **usuario**; categorías allowlist `preference|network|hardware|project|general`.
+2. **Extractor:** `qwen2.5:7b` devuelve JSON con 0–2 hechos; solo parafrasea al **usuario**; categorías allowlist `preference|network|hardware|project|general`.
 3. **Filtros:** secretos por regex, groundedness mínima, longitud.
 4. **Dedup:** si ya hay un vecino con distancia ≤ `0.25`, no escribe.
 5. **Write** en Chroma con `source=soft_auto`. Solo logs (`[Memory]: soft-auto saved|skipped|…`); **nunca habla**.
@@ -529,12 +531,34 @@ Roadmaps: [`ROADMAP.md`](ROADMAP.md) (voz/core), [`ROADMAP_2.md`](ROADMAP_2.md) 
 
 ---
 
+## Tests (evals)
+
+Scripts en [`tests/`](tests/) que llaman a los modelos reales y puntúan el comportamiento. Úsalos **antes y después** de tocar un prompt, el schema de una tool, un modelo o Whisper, y compara los números.
+
+| Script | Qué mide |
+|---|---|
+| `tests/eval_intent.py` | Atajo de charla (sin LLM) + clasificador de intents. Separa frases parecidas a los ejemplos del prompt de frases nuevas, para detectar si el prompt solo "memoriza". |
+| `tests/eval_tools.py` | Turno de tools completo (reescritura de follow-ups, llamadas forzadas): tool correcta y argumentos correctos. Ejecuta la calculadora y la traducción de `find_object` para comprobar el resultado final. |
+| `tests/eval_stt.py` | WER y latencia de Whisper por tamaño. Usa frases sintetizadas con Kokoro y, si existen, tus grabaciones en `tests/audio/` (`es_algo.wav` + `es_algo.txt`, 16 kHz mono). |
+
+Desde `engine/`:
+
+```bash
+proj-env\Scripts\python.exe tests\eval_intent.py
+proj-env\Scripts\python.exe tests\eval_tools.py --model qwen2.5:14b
+proj-env\Scripts\python.exe tests\eval_stt.py --sizes medium small
+```
+
+`eval_intent.py` y `eval_tools.py` devuelven código 1 si algún caso falla.
+
+---
+
 ## Consejos de uso
 
 1. **Frases claras y una intención por turno** — el VAD corta al silencio; evita monólogos largos.
 2. **Nombres concretos** — contenedores, carpetas y apps (“Cursor”, no “el editor”) mejoran el function calling.
 3. **Sandbox** — fuera de `ALLOWED_DATA_ROOT`, Kimmi dirá que no puede.
-4. **GPU** — Whisper `medium` + CUDA/`float16`. Si falta VRAM, baja a `small` o CPU/`int8`. El `tiny` (idioma / parciales) ya está cargado en el boot.
+4. **GPU** — Whisper `small` + CUDA/`float16` (`medium` es algo más preciso pero usa ~1,1 GB más; mídelo con `tests/eval_stt.py`). Si falta VRAM, baja a CPU/`int8`. El `tiny` (idioma / parciales) ya está cargado en el boot.
 5. **Voz** — sin markdown a propósito (TTS). Si el 14B tarda, deberías oír un filler (“Déjame comprobarlo” / “Let me check that”).
 6. **Confirmación** — “sí” / “dale” o “no” / “cancelar”.
 7. **SearXNG** — sin él fallan web search, research y competencia (errores controlados, sin inventar).

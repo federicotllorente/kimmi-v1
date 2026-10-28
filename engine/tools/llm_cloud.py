@@ -7,7 +7,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 CLOUD_TIMEOUT_SEC = 90
-QUERY_EXPAND_MODEL_DEFAULT = "qwen2.5:3b"
+QUERY_EXPAND_MODEL_DEFAULT = "qwen2.5:7b"
 VALID_PROVIDERS = frozenset({"local", "claude", "chatgpt"})
 
 
@@ -15,7 +15,7 @@ def research_model() -> str:
     return (
         (os.environ.get("KIMMI_RESEARCH_MODEL") or "").strip()
         or (os.environ.get("KIMMI_LLM_MODEL") or "").strip()
-        or "qwen2.5:14b"
+        or "qwen2.5:7b"
     )
 
 

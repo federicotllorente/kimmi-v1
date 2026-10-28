@@ -17,6 +17,7 @@ from tools.manage_clipboard import manage_clipboard
 from tools.manage_docker_container import manage_docker_container
 from tools.read_files import read_directory_files
 from tools.remember_fact import remember_fact
+from tools.robot_vision import describe_scene, find_object
 from tools.scaffold_project import TEMPLATES, scaffold_project
 from tools.search_codebase import search_codebase
 from tools.web_search import web_search
@@ -126,11 +127,14 @@ def build_tools(
         )
 
     def _launch(
-        app_id: str,
+        app_id: str = "",
         path: str = "",
         focus_after: bool = True,
         profile: str = "default",
     ) -> str:
+        # Safety net: a small model may still put the app name in `path`.
+        if not app_id and path.strip().lower() in list_allowed_app_ids():
+            app_id, path = path.strip().lower(), ""
         return launch_app(
             app_id,
             path=path,
@@ -214,6 +218,9 @@ def build_tools(
             },
             ensure_ascii=False,
         )
+
+    def _find_object(name: str, color: str = "") -> str:
+        return find_object(name, color=color, llm_model=llm_model)
 
     def _start_research(topic: str, provider: str = "") -> str:
         return start_research(
@@ -324,8 +331,23 @@ def build_tools(
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "app_id": {"type": "string"},
-                        "path": {"type": "string"},
+                        # Without enum + description the 7B put the app name in
+                        # `path` and left app_id out (measured 1/4 -> 4/4).
+                        "app_id": {
+                            "type": "string",
+                            "enum": list_allowed_app_ids(),
+                            "description": (
+                                f"REQUIRED. Which app to open: {apps} "
+                                "(vscode = Visual Studio Code)."
+                            ),
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": (
+                                "Optional folder, URL or workspace alias to open in the app. "
+                                "Leave empty unless the user named one. Never the app name."
+                            ),
+                        },
                         "focus_after": {"type": "boolean"},
                         "profile": {
                             "type": "string",
@@ -649,6 +671,55 @@ def build_tools(
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "describe_scene",
+                "description": (
+                    "List the objects the robot camera currently sees, with their color "
+                    "and position on a 3x3 grid. Use when the user asks what the camera "
+                    "or robot sees, or what is on the table."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "find_object",
+                "description": (
+                    "Find a specific object with the robot camera and report where it is. "
+                    "Use when the user asks where something is, or whether a given object "
+                    "(optionally of a given color) is in view. Read-only: it does not move "
+                    "the robot."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": (
+                                "Object name in ENGLISH, singular, lowercase "
+                                '(e.g. "pencil", "cup", "scissors"), even if the user '
+                                "spoke another language."
+                            ),
+                        },
+                        "color": {
+                            "type": "string",
+                            "description": (
+                                "Optional color in English: red, orange, yellow, green, "
+                                "blue or purple. Leave empty if the user gave none."
+                            ),
+                        },
+                    },
+                    "required": ["name"],
+                },
+            },
+        },
     ]
 
     if enable_demo_jobs:
@@ -701,6 +772,8 @@ def build_tools(
         "list_jobs": _list_jobs,
         "start_research": _start_research,
         "start_competition_analysis": _start_competition,
+        "describe_scene": describe_scene,
+        "find_object": _find_object,
     }
     if enable_demo_jobs:
         handlers["run_demo_long_job"] = _demo_job
@@ -721,6 +794,11 @@ def tools_for_intent(intent: str, tools_schema: List[dict]) -> List[dict]:
     return filtered
 
 
+# Start of the memory block appended to the user message. Also used to split
+# that block off again (see assistant._run_tools_turn).
+MEMORY_BLOCK_HEADER = "Relevant memories retrieved from your long-term memory"
+
+
 def format_memory_block(memory_context: str) -> str:
     """Bloque de recuerdos que se adjunta al mensaje del usuario.
 
@@ -731,7 +809,7 @@ def format_memory_block(memory_context: str) -> str:
     if not memory_context or not memory_context.strip():
         return ""
     return (
-        "Relevant memories retrieved from your long-term memory "
+        f"{MEMORY_BLOCK_HEADER} "
         "(use them only if they help you answer; do not invent others):\n"
         f"{memory_context.strip()}"
     )
@@ -791,7 +869,11 @@ def build_system_prompt(allowed_root: str, language_name: str) -> str:
         "TOOL DISCIPLINE: "
         "Only call a tool if the user asks for a concrete action "
         "(open, list, write, search code, Docker, clipboard, calculation, docs, web search, "
-        "research, competition analysis, background job, remember). "
+        "research, competition analysis, background job, remember, robot camera). "
+        "VISION: positions from describe_scene and find_object are 3x3 grid cells seen "
+        "from the camera (e.g. MIDDLE-LEFT); say them naturally in the reply language. "
+        "If a vision tool returns \"vision_offline\", tell the user the camera program "
+        "is not running. "
         "Greetings, small talk, opinions or general questions: answer WITHOUT tools. "
         "If you are unsure which tool applies or data is missing: ask, do not execute. "
         "Prefer zero tools over the wrong one. Never invent tool results. "
